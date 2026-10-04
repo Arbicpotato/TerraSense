@@ -1,0 +1,10 @@
+{
+  "description": "Manage and monitor your smart greenhouse with real-time data, automated climate control, and remote access to optimize plant growth and resource efficiency.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

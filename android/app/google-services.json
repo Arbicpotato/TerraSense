@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "214542249444",
+    "firebase_url": "https://terrasense-dde20-default-rtdb.firebaseio.com",
+    "project_id": "terrasense-dde20",
+    "storage_bucket": "terrasense-dde20.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:214542249444:android:f845d4df9625cad78e2bf1",
+        "android_client_info": {
+          "package_name": "com.terrasense.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "214542249444-7pikat2fpalfrlllnchn2ieiupvgscha.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.terrasense.app",
+            "certificate_hash": "ad7c5452715d6562f9fd33a1eec284e74837dc42"
+          }
+        },
+        {
+          "client_id": "214542249444-pkn94q7en8ami7cm5lv596fkhel4ro6p.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDdVYQ29k8BkDhRO0d7VenAhR8C76fT0Ks"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "214542249444-pkn94q7en8ami7cm5lv596fkhel4ro6p.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

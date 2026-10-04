@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80" role="img" aria-labelledby="title">
+  <title id="title">TerraSense leaf logo</title>
+  <rect width="80" height="80" rx="24" fill="#57b878"/>
+  <g
+    transform="translate(21 21) scale(1.5833)"
+    fill="none"
+    stroke="#173b2c"
+    stroke-width="1.8"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="M20 4c-7 0-13 3-13 10 0 3 2 5 5 5 7 0 8-8 8-15Z"/>
+    <path d="M4 21c2-6 6-9 12-12"/>
+  </g>
+</svg>

@@ -1,0 +1,158 @@
+@import url("https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap");
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --color-canvas: #f4f6f1;
+  --color-ink: #17231d;
+  --color-muted: #738078;
+  --color-border: #e4e9e3;
+  --color-forest: #173b2c;
+  --color-leaf: #57b878;
+  --color-mint: #dff3e5;
+  --color-sand: #e9e1c4;
+  --color-blue: #5b9fd6;
+  --color-blue-soft: #eaf4fb;
+  --color-blue-ink: #367aaf;
+  --color-green: #58b47a;
+  --color-green-soft: #e9f7ed;
+  --color-green-ink: #308452;
+  --color-amber: #e3a54b;
+  --color-amber-soft: #fbf3df;
+  --color-amber-ink: #9a681d;
+  --color-purple: #9276ca;
+  --color-purple-soft: #f1edfa;
+  --color-purple-ink: #7357af;
+  --color-coral: #d95f55;
+  --color-coral-soft: #fbebe9;
+  --shadow-card: 0 1px 2px rgb(23 59 44 / 0.03), 0 8px 30px rgb(23 59 44 / 0.035);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: var(--color-canvas);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--color-leaf) 42%, transparent);
+  outline-offset: 2px;
+}
+
+.safe-header-top {
+  padding-top: max(3.5rem, calc(env(safe-area-inset-top) + 0.5rem));
+}
+
+.safe-auth-top {
+  padding-top: max(3rem, calc(env(safe-area-inset-top) + 1.25rem));
+}
+
+.safe-page-top {
+  padding-top: max(2rem, calc(env(safe-area-inset-top) + 0.75rem));
+}
+
+.safe-setup-top {
+  padding-top: max(2.5rem, calc(env(safe-area-inset-top) + 1rem));
+}
+
+.safe-overlay-panel {
+  padding-top: max(1.25rem, calc(env(safe-area-inset-top) + 1rem));
+  padding-bottom: max(1.25rem, env(safe-area-inset-bottom));
+}
+
+.safe-profile-panel {
+  padding-top: max(1.5rem, calc(env(safe-area-inset-top) + 1rem));
+  padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
+}
+
+.island-scroll {
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.island-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.nav-active {
+  animation: nav-settle 320ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes nav-settle {
+  0% {
+    transform: scale(0.86);
+  }
+  58% {
+    transform: scale(1.04);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nav-active {
+    animation: none;
+  }
+}
+
+.splash-mark {
+  animation: splash-mark 700ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.splash-copy {
+  animation: splash-copy 500ms ease-out 180ms both;
+}
+
+.splash-progress {
+  animation: splash-progress 1.45s ease-in-out 100ms both;
+}
+
+@keyframes splash-mark {
+  from {
+    opacity: 0;
+    transform: scale(0.6) rotate(-12deg);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) rotate(0);
+  }
+}
+
+@keyframes splash-copy {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes splash-progress {
+  from {
+    width: 0;
+  }
+  to {
+    width: 100%;
+  }
+}

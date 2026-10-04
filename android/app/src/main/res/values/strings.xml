@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">TerraSense</string>
+    <string name="title_activity_main">TerraSense</string>
+    <string name="package_name">com.terrasense.app</string>
+    <string name="custom_url_scheme">com.terrasense.app</string>
+</resources>
