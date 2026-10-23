@@ -6,12 +6,9 @@ import {
   createUserWithEmailAndPassword, signInWithEmailAndPassword,
   updateProfile, onAuthStateChanged, signOut, type User,
 } from "firebase/auth"
-import { auth, firestore } from "./firebase"
-import {
-  doc,
-  setDoc,
-  serverTimestamp,
-} from "firebase/firestore"
+import { auth, db, firestore } from "./firebase"
+import { doc, setDoc, getDoc, serverTimestamp } from "firebase/firestore"
+import { ref, onValue, set, remove, query, limitToLast } from "firebase/database"
 
 
 
@@ -31,6 +28,51 @@ async function googleSignIn() {
   } else {
     await signInWithPopup(auth, new GoogleAuthProvider())
   }
+}
+
+const GH_ID_PATTERN = /^TS-GH-[A-Z0-9]{4,}$/
+
+function isPermissionError(e: any) {
+  return /permission[_ ]denied/i.test(`${e?.code ?? ""} ${e?.message ?? ""}`)
+}
+
+/**
+ * Claims a TerraSense hub (ESP32) for the signed-in user.
+ * The ESP32 registers itself and a secret claim code in the database; the security
+ * rules only accept ownerUid = <this user> if the code matches the device's code.
+ */
+async function claimGreenhouse(
+  uid: string,
+  input: { id: string; code: string; name: string; location: string }
+) {
+  const id = input.id.trim().toUpperCase()
+  const code = input.code.trim().toUpperCase()
+
+  if (!GH_ID_PATTERN.test(id)) throw new Error("Enter a valid ID in the format TS-GH-XXXX.")
+  if (!code) throw new Error("Enter the claim code printed on your TerraSense hub.")
+
+  try {
+    await set(ref(db, `claims/${id}/${uid}`), code)
+    await set(ref(db, `greenhouses/${id}/ownerUid`), uid)
+    await set(ref(db, `userGreenhouses/${uid}/${id}`), true)
+    await set(ref(db, `greenhouses/${id}/meta`), {
+      name: input.name.trim() || `Greenhouse ${id.slice(-4)}`,
+      location: input.location.trim() || "Location not set",
+      crop: "No crop selected",
+      stage: "Setup",
+    })
+  } catch (e) {
+    if (isPermissionError(e)) {
+      throw new Error(
+        "Couldn't claim this greenhouse. Check the ID and claim code, or it may already belong to another account."
+      )
+    }
+    throw e
+  } finally {
+    remove(ref(db, `claims/${id}/${uid}`)).catch(() => {})
+  }
+
+  return id
 }
 
 function authMessage(e: any) {
@@ -59,6 +101,8 @@ type IconName =
   | "pause"
   | "menu"
   | "close"
+  | "plus"
+  | "logout"
 
 const iconPaths: Record<IconName, React.ReactNode> = {
   grid: <><rect x="3" y="3" width="7" height="7" rx="2" /><rect x="14" y="3" width="7" height="7" rx="2" /><rect x="3" y="14" width="7" height="7" rx="2" /><rect x="14" y="14" width="7" height="7" rx="2" /></>,
@@ -78,6 +122,8 @@ const iconPaths: Record<IconName, React.ReactNode> = {
   pause: <><path d="M9 8v8M15 8v8" /><circle cx="12" cy="12" r="9" /></>,
   menu: <><path d="M4 7h16M4 12h16M4 17h16" /></>,
   close: <><path d="m6 6 12 12M18 6 6 18" /></>,
+  plus: <path d="M12 5v14M5 12h14" />,
+  logout: <><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><path d="m16 17 5-5-5-5" /><path d="M21 12H9" /></>,
 }
 
 function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
@@ -91,26 +137,46 @@ const navItems: { label: string; icon: IconName }[] = [
   { label: "Plant Library", icon: "book" },
 ]
 
-const sensors = [
-  { label: "Temperature", value: "24.8", unit: "°C", target: "Target 22–26°C", icon: "thermometer" as IconName, tone: "amber", progress: 66 },
-  { label: "Humidity", value: "68", unit: "%", target: "Target 60–75%", icon: "droplet" as IconName, tone: "blue", progress: 68 },
-  { label: "Soil moisture", value: "74", unit: "%", target: "Target 65–80%", icon: "leaf" as IconName, tone: "green", progress: 74 },
+const sensorDefs = [
+  { key: "temperature", label: "Temperature", unit: "°C", icon: "thermometer" as IconName, tone: "amber", max: 50 },
+  { key: "humidity", label: "Humidity", unit: "%", icon: "droplet" as IconName, tone: "blue", max: 100 },
+  { key: "soilMoisture", label: "Soil moisture", unit: "%", icon: "leaf" as IconName, tone: "green", max: 100 },
+] as const
+
+const controlDefs: { key: string; name: string; icon: IconName }[] = [
+  { key: "pump", name: "Irrigation pump", icon: "droplet" },
+  { key: "lights", name: "Grow lights", icon: "sun" },
+  { key: "heater", name: "Heating system", icon: "thermometer" },
+  { key: "cooler", name: "Cooling system", icon: "wind" },
+  { key: "humidifier", name: "Humidifier", icon: "droplet" },
+  { key: "fertilizer", name: "Fertilizer pump", icon: "flask" },
 ]
 
-const initialControls = [
-  { name: "Irrigation pump", detail: "Last run 32 min ago", icon: "droplet" as IconName, enabled: false },
-  { name: "Grow lights", detail: "On until 6:30 PM", icon: "sun" as IconName, enabled: true },
-  { name: "Heating system", detail: "Ready · Target 24°C", icon: "thermometer" as IconName, enabled: false },
-  { name: "Cooling system", detail: "Running · Low speed", icon: "wind" as IconName, enabled: true },
-  { name: "Humidifier", detail: "Ready · Target 68%", icon: "droplet" as IconName, enabled: false },
-  { name: "Fertilizer pump", detail: "Next dose in 2 days", icon: "flask" as IconName, enabled: false },
-]
+const ONLINE_WINDOW_MS = 2 * 60 * 1000
+const isOnline = (lastSeen: number | undefined, now: number) => !!lastSeen && now - lastSeen < ONLINE_WINDOW_MS
 
-const chartValues: Record<string, number[]> = {
-  "24h": [42, 38, 36, 43, 55, 67, 72, 66, 61, 58, 64, 70],
-  "7d": [48, 54, 43, 67, 62, 74, 68, 71, 58, 65, 73, 69],
-  "30d": [39, 48, 55, 51, 60, 70, 64, 75, 68, 72, 66, 74],
+type LiveData = {
+  temperature?: number
+  humidity?: number
+  soilMoisture?: number
+  waterTank?: number
+  fertilizer?: number
+  updatedAt?: number
 }
+
+type StageDef = {
+  key: string
+  name: string
+  days: number
+  tempMin: number
+  tempMax: number
+  moistureMin: number
+  moistureMax: number
+  lightHours: number
+  feedEveryDays: number
+}
+
+type PlanView = { plantId: string; name: string; startedAt: number; stages: StageDef[] }
 
 type Greenhouse = {
   id: string
@@ -118,18 +184,57 @@ type Greenhouse = {
   location: string
   crop: string
   stage: string
-  devices: number
-  status: string
+  lastSeen?: number
+  plan?: PlanView
 }
 
 type PlantProfile = {
+  id: string
   name: string
-  stage: string
-  days: string
-  temperature: string
-  moisture: string
+  category: string
   image?: string
-  downloaded?: boolean
+  stages: StageDef[]
+}
+
+function toStageList(raw: any): StageDef[] {
+  return Object.entries(raw ?? {})
+    .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+    .map(([key, st]: [string, any]) => ({
+      key,
+      name: String(st?.name ?? key),
+      days: Number(st?.days) || 0,
+      tempMin: Number(st?.tempMin) || 0,
+      tempMax: Number(st?.tempMax) || 0,
+      moistureMin: Number(st?.moistureMin) || 0,
+      moistureMax: Number(st?.moistureMax) || 0,
+      lightHours: Number(st?.lightHours) || 0,
+      feedEveryDays: Number(st?.feedEveryDays) || 0,
+    }))
+}
+
+function stagesToObject(stages: StageDef[]) {
+  return Object.fromEntries(stages.map(({ key, ...rest }) => [key, rest]))
+}
+
+function toPlant(id: string, p: any): PlantProfile {
+  return {
+    id,
+    name: String(p?.name ?? id),
+    category: String(p?.category ?? "Other"),
+    ...(p?.image ? { image: String(p.image) } : {}),
+    stages: toStageList(p?.stages),
+  }
+}
+
+function currentStage(plan: { startedAt: number; stages: StageDef[] } | undefined, now: number) {
+  if (!plan || plan.stages.length === 0) return null
+  const day = Math.max(1, Math.floor((now - plan.startedAt) / 86400000) + 1)
+  let end = 0
+  for (const stage of plan.stages) {
+    end += stage.days
+    if (day <= end) return { stage, day, finished: false }
+  }
+  return { stage: plan.stages[plan.stages.length - 1], day, finished: true }
 }
 
 type WifiSettings = {
@@ -137,12 +242,6 @@ type WifiSettings = {
   password: string
   deviceName: string
 }
-
-const initialGreenhouses: Greenhouse[] = [
-  { id: "TS-GH-A1048", name: "Greenhouse A", location: "North garden", crop: "Cherry Tomato", stage: "Fruiting", devices: 8, status: "Healthy" },
-  { id: "TS-GH-B2093", name: "Greenhouse B", location: "East garden", crop: "Sweet Basil", stage: "Vegetative", devices: 6, status: "Healthy" },
-  { id: "TS-GH-P3186", name: "Propagation House", location: "West garden", crop: "Butterhead Lettuce", stage: "Seedling", devices: 5, status: "Attention" },
-]
 
 const toneClasses: Record<string, { soft: string; ink: string; fill: string }> = {
   amber: { soft: "bg-amber-soft", ink: "text-amber-ink", fill: "bg-amber" },
@@ -152,7 +251,14 @@ const toneClasses: Record<string, { soft: string; ink: string; fill: string }> =
 }
 
 function Sparkline({ values }: { values: number[] }) {
-  const points = values.map((value, index) => `${(index / (values.length - 1)) * 100},${88 - value}`).join(" ")
+  if (values.length < 2) {
+    return <div className="grid h-36 place-items-center text-xs text-muted">Not enough readings yet</div>
+  }
+  const min = Math.min(...values)
+  const max = Math.max(...values)
+  const span = max - min || 1
+  const y = (value: number) => 80 - ((value - min) / span) * 68
+  const points = values.map((value, index) => `${(index / (values.length - 1)) * 100},${y(value)}`).join(" ")
   const area = `0,88 ${points} 100,88`
   return (
     <svg className="h-36 w-full overflow-visible" viewBox="0 0 100 90" preserveAspectRatio="none" aria-label="Temperature trend chart">
@@ -162,10 +268,10 @@ function Sparkline({ values }: { values: number[] }) {
           <stop offset="100%" stopColor="var(--color-leaf)" stopOpacity="0" />
         </linearGradient>
       </defs>
-      {[18, 41, 64, 87].map((y) => <line key={y} x1="0" x2="100" y1={y} y2={y} stroke="var(--color-border)" strokeWidth=".5" strokeDasharray="2 2" />)}
+      {[18, 41, 64, 87].map((line) => <line key={line} x1="0" x2="100" y1={line} y2={line} stroke="var(--color-border)" strokeWidth=".5" strokeDasharray="2 2" />)}
       <polygon points={area} fill="url(#chartFill)" />
       <polyline points={points} fill="none" stroke="var(--color-leaf)" strokeWidth="2" vectorEffect="non-scaling-stroke" strokeLinecap="round" strokeLinejoin="round" />
-      <circle cx="100" cy={88 - values.at(-1)!} r="1.8" fill="var(--color-leaf)" stroke="white" strokeWidth=".9" vectorEffect="non-scaling-stroke" />
+      <circle cx="100" cy={y(values[values.length - 1])} r="1.8" fill="var(--color-leaf)" stroke="white" strokeWidth=".9" vectorEffect="non-scaling-stroke" />
     </svg>
   )
 }
@@ -173,25 +279,77 @@ function Sparkline({ values }: { values: number[] }) {
 function App() {
   const [authScreen, setAuthScreen] = useState<"app" | "splash" | "login" | "register" | "setup">("splash")
   const [activeNav, setActiveNav] = useState("Overview")
-  const [period, setPeriod] = useState("24h")
-  const [controls, setControls] = useState(initialControls)
   const [mobileNav, setMobileNav] = useState(false)
   const [alertOpen, setAlertOpen] = useState(false)
-  const [stopped, setStopped] = useState(false)
-  const [manualMode, setManualMode] = useState(false)
-  const [greenhouses, setGreenhouses] = useState(initialGreenhouses)
   const [downloadedPlants, setDownloadedPlants] = useState<PlantProfile[]>([])
-  const [wifiSettings, setWifiSettings] = useState<WifiSettings>({ ssid: "Greenhouse WiFi", password: "terrademo", deviceName: "TerraSense Hub" })
-  const [hasDevice, setHasDevice] = useState(true)
+  const [library, setLibrary] = useState<PlantProfile[]>([])
+  const [wifiSettings, setWifiSettings] = useState<WifiSettings>({ ssid: "", password: "", deviceName: "TerraSense Hub" })
   const [currentGreenhouse, setCurrentGreenhouse] = useState(0)
+  const [pendingSelect, setPendingSelect] = useState<string | null>(null)
   const [profileOpen, setProfileOpen] = useState(false)
-  const updatedTime = useMemo(() => new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), [])
-  const greenhouse = greenhouses[currentGreenhouse]
 
-   const [user, setUser] = useState<User | null>(null)
+  const [user, setUser] = useState<User | null>(null)
   const [authReady, setAuthReady] = useState(false)
 
+  // Greenhouses the signed-in user owns (loaded from Firebase, never hard-coded)
+  const [ghIds, setGhIds] = useState<string[]>([])
+  const [ghMeta, setGhMeta] = useState<Record<string, any>>({})
+  const [ghSeen, setGhSeen] = useState<Record<string, number>>({})
+
+  // Live data for the greenhouse currently selected
+  const [live, setLive] = useState<LiveData | null>(null)
+  const [controlState, setControlState] = useState<Record<string, boolean>>({})
+  const [history, setHistory] = useState<number[]>([])
+  const [now, setNow] = useState(() => Date.now())
+
+  const greenhouses: Greenhouse[] = useMemo(
+    () =>
+      ghIds
+        .filter((id) => ghMeta[id] !== undefined)
+        .map((id) => {
+          const raw = ghMeta[id]
+          const plan: PlanView | undefined = raw.plan
+            ? {
+                plantId: String(raw.plan.plantId ?? ""),
+                name: String(raw.plan.name ?? "Plant"),
+                startedAt: Number(raw.plan.startedAt) || now,
+                stages: toStageList(raw.plan.stages),
+              }
+            : undefined
+          const cur = currentStage(plan, now)
+          return {
+            id,
+            name: raw.name ?? id,
+            location: raw.location ?? "Location not set",
+            crop: plan?.name ?? "No crop selected",
+            stage: cur ? (cur.finished ? "Complete" : cur.stage.name) : "Setup",
+            lastSeen: ghSeen[id],
+            plan,
+          }
+        }),
+    [ghIds, ghMeta, ghSeen, now]
+  )
+  const myPlants = useMemo(
+    () => downloadedPlants.map((p) => ({ ...p, image: library.find((l) => l.id === p.id)?.image ?? p.image })),
+    [downloadedPlants, library]
+  )
+  const greenhouse: Greenhouse | null = greenhouses[currentGreenhouse] ?? null
+  const currentId = greenhouse?.id
+  const hasDevice = !!greenhouse
+  const online = isOnline(greenhouse?.lastSeen, now)
+  const stopped = controlState.emergencyStop === true
+  const manualMode = controlState.manual === true
+  const lowWater = typeof live?.waterTank === "number" && live.waterTank < 20
+  const lastUpdate = live?.updatedAt ? new Date(live.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "never"
+  const avgTemp = history.length ? (history.reduce((a, b) => a + b, 0) / history.length).toFixed(1) : null
+  const controls = controlDefs.map((def) => ({ ...def, enabled: controlState[def.key] === true, detail: controlState[def.key] === true ? "On" : "Off" }))
+
   useEffect(() => onAuthStateChanged(auth, (u) => { setUser(u); setAuthReady(true) }), [])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   useEffect(() => {
     if (authScreen !== "splash" || !authReady) return
@@ -208,15 +366,109 @@ function App() {
     }
   }, [profileOpen, mobileNav])
 
-  const toggleControl = (name: string) => {
+  // 1) The list of greenhouses: ONLY the ones indexed under this user's uid
+  useEffect(() => {
+    if (!user) {
+      setGhIds([])
+      setGhMeta({})
+      setGhSeen({})
+      return
+    }
+    const offs = new Map<string, () => void>()
+    const offIndex = onValue(
+      ref(db, `userGreenhouses/${user.uid}`),
+      (snap) => {
+        const ids = Object.keys(snap.val() ?? {}).sort()
+        setGhIds(ids)
+        offs.forEach((off, id) => {
+          if (!ids.includes(id)) { off(); offs.delete(id) }
+        })
+        ids.forEach((id) => {
+          if (offs.has(id)) return
+          const offMeta = onValue(ref(db, `greenhouses/${id}/meta`), (s) => setGhMeta((m) => ({ ...m, [id]: s.val() ?? {} })))
+          const offSeen = onValue(ref(db, `greenhouses/${id}/live/updatedAt`), (s) => setGhSeen((m) => ({ ...m, [id]: Number(s.val()) || 0 })))
+          offs.set(id, () => { offMeta(); offSeen() })
+        })
+      },
+      (err) => console.error("Greenhouse list error:", err)
+    )
+    return () => {
+      offIndex()
+      offs.forEach((off) => off())
+    }
+  }, [user?.uid])
+
+  // 2) Live readings, control state and history for the selected greenhouse
+  useEffect(() => {
+    setLive(null)
+    setControlState({})
+    setHistory([])
+    if (!currentId) return
+    const base = `greenhouses/${currentId}`
+    const offLive = onValue(ref(db, `${base}/live`), (s) => setLive(s.val() ?? {}))
+    const offControls = onValue(ref(db, `${base}/controls`), (s) => setControlState(s.val() ?? {}))
+    const offHistory = onValue(query(ref(db, `${base}/history`), limitToLast(48)), (s) => {
+      const rows: number[] = []
+      s.forEach((child) => {
+        const t = Number(child.val()?.temperature)
+        if (Number.isFinite(t)) rows.push(t)
+      })
+      setHistory(rows)
+    })
+    return () => { offLive(); offControls(); offHistory() }
+  }, [currentId])
+
+  // 3) Saved Wi-Fi settings for the selected greenhouse
+  useEffect(() => {
+    setWifiSettings({ ssid: "", password: "", deviceName: "TerraSense Hub" })
+    if (!user || !currentId) return
+    let cancelled = false
+    getDoc(doc(firestore, "users", user.uid, "devices", currentId))
+      .then((snap) => {
+        if (cancelled || !snap.exists()) return
+        const d = snap.data()
+        setWifiSettings({ ssid: d.ssid ?? "", password: d.wifiPassword ?? "", deviceName: d.name ?? "TerraSense Hub" })
+      })
+      .catch((e) => console.error("Wi-Fi settings load error:", e))
+    return () => { cancelled = true }
+  }, [user?.uid, currentId])
+
+  // Select a newly claimed greenhouse once it shows up; keep the index in range
+  useEffect(() => {
+    if (pendingSelect) {
+      const index = greenhouses.findIndex((g) => g.id === pendingSelect)
+      if (index >= 0) { setCurrentGreenhouse(index); setPendingSelect(null) }
+      return
+    }
+    if (currentGreenhouse > 0 && currentGreenhouse >= greenhouses.length) setCurrentGreenhouse(0)
+  }, [greenhouses, pendingSelect, currentGreenhouse])
+
+  // Plant library (added by you in the cloud) + the user's saved plants
+  useEffect(() => {
+    if (!user) { setLibrary([]); setDownloadedPlants([]); return }
+    const offLib = onValue(ref(db, "plantLibrary"), (snap) => {
+      setLibrary(Object.entries(snap.val() ?? {}).map(([id, p]) => toPlant(id, p)))
+    }, (e) => console.error("Plant library error:", e))
+    const offMine = onValue(ref(db, `userPlants/${user.uid}`), (snap) => {
+      setDownloadedPlants(Object.entries(snap.val() ?? {}).map(([id, p]) => toPlant(id, p)))
+    }, (e) => console.error("User plants error:", e))
+    return () => { offLib(); offMine() }
+  }, [user?.uid])
+
+  const setControlFlag = (key: string, value: boolean) => {
+    if (!greenhouse) return
+    set(ref(db, `greenhouses/${greenhouse.id}/controls/${key}`), value).catch((e) => console.error("Control write failed:", e))
+  }
+
+  const toggleControl = (key: string) => {
     if (stopped || !manualMode) return
-    setControls((items) => items.map((item) => item.name === name ? { ...item, enabled: !item.enabled } : item))
+    setControlFlag(key, !controlState[key])
   }
 
   if (authScreen === "splash") return <SplashScreen />
   if (authScreen === "login") return <LoginScreen onLogin={() => setAuthScreen("app")} onCreateAccount={() => setAuthScreen("register")} />
-  if (authScreen === "register") return <RegisterScreen onRegister={() => { setHasDevice(false); setAuthScreen("setup") }} onBackToLogin={() => setAuthScreen("login")} />
-  if (authScreen === "setup") return <WifiSetupScreen onComplete={(settings) => { setWifiSettings(settings); setHasDevice(settings.ssid !== "Not configured"); setAuthScreen("app") }} />
+  if (authScreen === "register") return <RegisterScreen onRegister={() => setAuthScreen("setup")} onBackToLogin={() => setAuthScreen("login")} />
+  if (authScreen === "setup") return <WifiSetupScreen onComplete={(settings, greenhouseId) => { setWifiSettings(settings); setPendingSelect(greenhouseId); setAuthScreen("app") }} onSkip={() => setAuthScreen("app")} />
   function UserAvatar({
   size = "size-9",
 }: {
@@ -254,17 +506,17 @@ function App() {
   return (
     <div className="min-h-dvh bg-forest text-ink">
       <main className="mx-auto min-h-dvh w-full max-w-md bg-canvas pb-24 shadow-2xl">
-        <header className="safe-header-top sticky top-0 z-30 border-b border-border/70 bg-canvas/95 px-4 pb-4 backdrop-blur-xl">
+        <header style={{ paddingLeft: "1.5rem", paddingRight: "1.5rem" }} className="safe-header-top sticky top-0 z-30 border-b border-border/70 bg-canvas pb-4">
           <div className="relative flex items-center justify-between">
             <button onClick={() => setMobileNav(true)} className="grid size-9 place-items-center rounded-full bg-white text-forest shadow-card" aria-label="Open navigation"><Icon name="menu" size={18} /></button>
             <div className="absolute left-1/2 max-w-40 -translate-x-1/2 px-3 text-center">
-              <p className="truncate text-sm font-extrabold tracking-tight">{greenhouse.name}</p>
-              <p className="text-[9px] font-bold uppercase tracking-widest text-leaf">Active greenhouse</p>
+              <p className="truncate text-sm font-extrabold tracking-tight">{greenhouse?.name ?? "TerraSense"}</p>
+              <p className="text-[9px] font-bold uppercase tracking-widest text-leaf">{greenhouse ? "Active greenhouse" : "No greenhouse yet"}</p>
             </div>
             <div className="flex items-center gap-2">
               <div className="relative">
-                <button onClick={() => setAlertOpen(!alertOpen)} className="relative grid size-9 place-items-center rounded-full bg-white text-muted shadow-card" aria-label="Notifications"><Icon name="bell" size={17} /><span className="absolute right-1.5 top-1.5 size-2 rounded-full border-2 border-white bg-coral" /></button>
-                {alertOpen && <div className="absolute right-0 top-12 z-40 w-72 rounded-2xl border border-border bg-white p-4 shadow-xl"><p className="text-xs font-bold">Water tank running low</p><p className="mt-1 text-[10px] text-muted">Refill recommended within 2 days.</p></div>}
+                <button onClick={() => setAlertOpen(!alertOpen)} className="relative grid size-9 place-items-center rounded-full bg-white text-muted shadow-card" aria-label="Notifications"><Icon name="bell" size={17} />{lowWater && <span className="absolute right-1.5 top-1.5 size-2 rounded-full border-2 border-white bg-coral" />}</button>
+                {alertOpen && <div className="absolute right-0 top-12 z-40 w-72 rounded-2xl border border-border bg-white p-4 shadow-xl">{lowWater ? <><p className="text-xs font-bold">Water tank running low</p><p className="mt-1 text-[10px] text-muted">Refill recommended soon.</p></> : <p className="text-xs font-bold">No new alerts</p>}</div>}
               </div>
              <button
   onClick={() => setProfileOpen(true)}
@@ -277,21 +529,21 @@ function App() {
 
           <div className="island-scroll mt-3 flex snap-x gap-2 overflow-x-auto rounded-3xl bg-ink p-1.5 shadow-lg">
             {greenhouses.map((item, index) => (
-              <button key={`${item.name}-${index}`} onClick={() => { setCurrentGreenhouse(index); setStopped(false); setManualMode(false) }} className={`flex shrink-0 snap-center items-center gap-2 rounded-full py-2 pl-2.5 pr-3 text-left transition-all ${currentGreenhouse === index ? "min-w-52 bg-white/12" : "bg-transparent"}`}>
-                <span className={`size-2 shrink-0 rounded-full ${item.status === "Healthy" ? "bg-leaf" : "bg-amber"}`} />
-                <span className="min-w-0"><span className="block truncate text-[10px] font-bold text-white">{item.name}</span>{currentGreenhouse === index && <span className="block truncate text-[9px] text-white/40">{item.crop} · {item.status}</span>}</span>
+              <button key={`${item.name}-${index}`} onClick={() => setCurrentGreenhouse(index)} className={`flex shrink-0 snap-center items-center gap-2 rounded-full py-2 pl-2.5 pr-3 text-left transition-all ${currentGreenhouse === index ? "min-w-52 bg-white/12" : "bg-transparent"}`}>
+                <span className={`size-2 shrink-0 rounded-full ${isOnline(item.lastSeen, now) ? "bg-leaf" : "bg-amber"}`} />
+                <span className="min-w-0"><span className="block truncate text-[10px] font-bold text-white">{item.name}</span>{currentGreenhouse === index && <span className="block truncate text-[9px] text-white/40">{item.crop} · {isOnline(item.lastSeen, now) ? "Online" : "Offline"}</span>}</span>
               </button>
             ))}
             <button onClick={() => setProfileOpen(true)} className="grid size-9 shrink-0 place-items-center rounded-full border border-white/15 text-sm font-bold text-white/60" aria-label="Add greenhouse">+</button>
           </div>
 
           <div className="mt-4 flex items-center justify-between">
-            <div><p role="heading" aria-level={1} className="text-xl font-bold tracking-tight">{activeNav}</p><p className="mt-0.5 text-[10px] text-muted">{greenhouse.name} · {greenhouse.location} · Updated {updatedTime}</p></div>
-            <button onClick={() => setStopped(!stopped)} className={`grid size-9 place-items-center rounded-full ${stopped ? "bg-forest text-white" : "bg-coral-soft text-coral"}`} aria-label={stopped ? "Resume system" : "Emergency stop"}><Icon name={stopped ? "bolt" : "pause"} size={16} /></button>
+            <div><p role="heading" aria-level={1} className="text-xl font-bold tracking-tight">{activeNav}</p><p className="mt-0.5 text-[10px] text-muted">{greenhouse ? `${greenhouse.name} · ${greenhouse.location} · Updated ${lastUpdate}` : "Add a greenhouse to get started"}</p></div>
+            <button onClick={() => setControlFlag("emergencyStop", !stopped)} disabled={!greenhouse} className={`grid size-9 place-items-center rounded-full ${stopped ? "bg-forest text-white" : "bg-coral-soft text-coral"}`} aria-label={stopped ? "Resume system" : "Emergency stop"}><Icon name={stopped ? "bolt" : "pause"} size={16} /></button>
           </div>
         </header>
 
-        <div className="space-y-5 p-4">
+        <div key={activeNav} style={{ paddingLeft: "1.5rem", paddingRight: "1.5rem" }} className="page-enter space-y-5 py-4">
           {stopped && (
             <div className="flex items-center gap-3 rounded-2xl border border-coral/20 bg-coral-soft p-4 text-sm font-semibold text-coral">
               <Icon name="pause" /> All automated systems are paused. Resume when the greenhouse is safe.
@@ -306,69 +558,53 @@ function App() {
               <div className="relative flex h-full min-h-72 flex-col justify-between p-6">
                 <div className="flex items-start justify-between">
                   <span className="rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-[11px] font-bold uppercase tracking-widest backdrop-blur">Active crop</span>
-                  <span className="flex items-center gap-2 text-xs text-white/65"><span className="size-2 rounded-full bg-leaf" />Automating</span>
+                  <span className="flex items-center gap-2 text-xs text-white/65"><span className={`size-2 rounded-full ${online ? "bg-leaf" : "bg-amber"}`} />{online ? "Online" : "Offline"}</span>
                 </div>
                 <div>
-                  <p className="text-sm font-medium text-mint">{greenhouse.crop} · {greenhouse.stage} stage</p>
-                  <p role="heading" aria-level={2} className="mt-2 text-3xl font-bold leading-tight tracking-tight">Your crop is thriving.</p>
-                  <p className="mt-3 max-w-lg text-sm leading-6 text-white/65">All critical conditions are within the ideal range. Next irrigation is scheduled in 28 minutes.</p>
+                  <p className="text-sm font-medium text-mint">{greenhouse?.crop === "No crop selected" ? "No crop selected" : `${greenhouse?.crop} · ${greenhouse?.stage} stage`}</p>
+                  <p role="heading" aria-level={2} className="mt-2 text-3xl font-bold leading-tight tracking-tight">{greenhouse?.name}</p>
+                  <p className="mt-3 max-w-lg text-sm leading-6 text-white/65">{online ? "Your TerraSense hub is connected and reporting live conditions." : "Your TerraSense hub isn't reporting right now. Check that it is powered on and connected to Wi-Fi."}</p>
                   <button onClick={() => setActiveNav("Plants")} className="mt-5 flex items-center gap-2 text-sm font-bold text-white">View plant profile <Icon name="chevron" size={16} /></button>
                 </div>
               </div>
             </div>
 
             <div className="rounded-3xl border border-border bg-white p-6 shadow-card">
-              <div className="flex items-start justify-between">
-                <div>
-                  <p className="text-sm font-bold">Resource levels</p>
-                  <p className="mt-1 text-xs text-muted">Estimated supply remaining</p>
-                </div>
-                <button className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-muted">Manage</button>
+              <div>
+                <p className="text-sm font-bold">Resource levels</p>
+                <p className="mt-1 text-xs text-muted">Reported by your TerraSense hub</p>
               </div>
               <div className="mt-6 space-y-6">
-                <ResourceLevel icon="tank" label="Water tank" value="38%" detail="~2 days left" tone="blue" width="38%" />
-                <ResourceLevel icon="flask" label="Fertilizer A" value="72%" detail="~12 days left" tone="green" width="72%" />
-                <ResourceLevel icon="bolt" label="Energy today" value="4.2 kWh" detail="-8% vs yesterday" tone="amber" width="56%" />
-              </div>
-              <div className="mt-6 rounded-2xl bg-canvas p-4">
-                <div className="flex items-center gap-3">
-                  <div className="grid size-9 place-items-center rounded-xl bg-amber-soft text-amber-ink"><Icon name="bell" size={17} /></div>
-                  <div className="flex-1">
-                    <p className="text-xs font-bold">Refill water tank soon</p>
-                    <p className="mt-0.5 text-[11px] text-muted">Recommended within 2 days</p>
-                  </div>
-                  <Icon name="chevron" size={16} />
-                </div>
+                {typeof live?.waterTank === "number" && <ResourceLevel icon="tank" label="Water tank" value={`${live.waterTank}%`} detail={live.waterTank < 20 ? "Refill soon" : "Level OK"} tone="blue" width={`${live.waterTank}%`} />}
+                {typeof live?.fertilizer === "number" && <ResourceLevel icon="flask" label="Fertilizer" value={`${live.fertilizer}%`} detail={live.fertilizer < 20 ? "Refill soon" : "Level OK"} tone="green" width={`${live.fertilizer}%`} />}
+                {typeof live?.waterTank !== "number" && typeof live?.fertilizer !== "number" && <p className="text-xs text-muted">No resource levels reported yet.</p>}
               </div>
             </div>
           </section>
 
           <section>
             <div className="mb-4 flex items-end justify-between">
-              <div><p role="heading" aria-level={2} className="text-lg font-bold tracking-tight">Live conditions</p><p className="mt-1 text-xs text-muted">Readings update every 30 seconds</p></div>
+              <div><p role="heading" aria-level={2} className="text-lg font-bold tracking-tight">Live conditions</p><p className="mt-1 text-xs text-muted">Live from your TerraSense hub</p></div>
               <button onClick={() => setActiveNav("Analytics")} className="text-xs font-bold text-forest">View analytics</button>
             </div>
             <div className="grid gap-4">
-              {sensors.map((sensor) => <SensorCard key={sensor.label} {...sensor} />)}
+              {sensorDefs.map((def) => {
+                const v = live?.[def.key]
+                return <SensorCard key={def.key} label={def.label} unit={def.unit} icon={def.icon} tone={def.tone} value={typeof v === "number" ? String(Math.round(v * 10) / 10) : "—"} progress={typeof v === "number" ? Math.max(0, Math.min(100, (v / def.max) * 100)) : 0} />
+              })}
             </div>
           </section>
 
           <section className="grid gap-5">
             <div className="rounded-3xl border border-border bg-white p-6 shadow-card">
-              <div className="flex flex-wrap items-start justify-between gap-4">
-                <div><p role="heading" aria-level={2} className="text-base font-bold">Temperature trend</p><p className="mt-1 text-xs text-muted">Average 24.2°C · Optimal range</p></div>
-                <div className="flex rounded-xl bg-canvas p-1">
-                  {Object.keys(chartValues).map((item) => <button key={item} onClick={() => setPeriod(item)} className={`rounded-lg px-3 py-1.5 text-[11px] font-bold transition ${period === item ? "bg-white text-forest shadow-sm" : "text-muted"}`}>{item}</button>)}
-                </div>
-              </div>
-              <div className="mt-6"><Sparkline values={chartValues[period]} /></div>
-              <div className="mt-1 flex justify-between text-[10px] font-medium text-muted"><span>12 AM</span><span>6 AM</span><span>12 PM</span><span>6 PM</span><span>Now</span></div>
+              <div><p role="heading" aria-level={2} className="text-base font-bold">Temperature trend</p><p className="mt-1 text-xs text-muted">{avgTemp ? `Average ${avgTemp}°C · last ${history.length} readings` : "No readings recorded yet"}</p></div>
+              <div className="mt-6"><Sparkline values={history} /></div>
             </div>
 
             <div className="rounded-3xl border border-border bg-white p-6 shadow-card">
               <div className="flex items-start justify-between">
                 <div><p role="heading" aria-level={2} className="text-base font-bold">Device controls</p><p className="mt-1 text-xs text-muted">{manualMode ? "Manual control enabled" : "Controlled by plant profile"}</p></div>
-                <button onClick={() => setManualMode(!manualMode)} disabled={stopped} className={`rounded-full px-3 py-1.5 text-xs font-semibold tracking-normal transition disabled:opacity-40 ${manualMode ? "bg-amber-soft text-amber-ink" : "bg-mint text-forest"}`}>{manualMode ? "Manual mode" : "Auto mode"}</button>
+                <button onClick={() => setControlFlag("manual", !manualMode)} disabled={stopped} className={`rounded-full px-3 py-1.5 text-xs font-semibold tracking-normal transition disabled:opacity-40 ${manualMode ? "bg-amber-soft text-amber-ink" : "bg-mint text-forest"}`}>{manualMode ? "Manual mode" : "Auto mode"}</button>
               </div>
               <div className={`mt-4 rounded-xl p-3 text-[10px] leading-4 ${manualMode ? "bg-amber-soft text-amber-ink" : "bg-canvas text-muted"}`}>
                 {manualMode ? "Manual mode is active. Device switches are now unlocked." : "Switch to Manual Mode before toggling lights, pumps, heating, cooling, or humidity."}
@@ -381,7 +617,7 @@ function App() {
                       <p className="truncate text-xs font-bold">{control.name}</p>
                       <p className="mt-1 truncate text-[10px] text-muted">{stopped ? "System paused" : !manualMode ? `Auto · ${control.detail}` : control.detail}</p>
                     </div>
-                    <button disabled={stopped || !manualMode} onClick={() => toggleControl(control.name)} className={`relative h-6 w-11 rounded-full transition disabled:cursor-not-allowed disabled:opacity-40 ${control.enabled && !stopped ? "bg-leaf" : "bg-border"}`} aria-label={`Toggle ${control.name}`}>
+                    <button disabled={stopped || !manualMode} onClick={() => toggleControl(control.key)} className={`relative h-6 w-11 rounded-full transition disabled:cursor-not-allowed disabled:opacity-40 ${control.enabled && !stopped ? "bg-leaf" : "bg-border"}`} aria-label={`Toggle ${control.name}`}>
                       <span className={`absolute top-1 size-4 rounded-full bg-white shadow-sm transition ${control.enabled && !stopped ? "left-6" : "left-1"}`} />
                     </button>
                   </div>
@@ -393,19 +629,43 @@ function App() {
 
           {activeNav === "Plants" && (
             <PlantsPage
-              downloadedPlants={downloadedPlants}
-              activePlant={greenhouse.crop === "No crop selected" ? null : greenhouse.crop}
-              onStart={(plant) => setGreenhouses((items) => items.map((item, index) => index === currentGreenhouse ? { ...item, crop: plant.name, stage: plant.stage, status: "Healthy" } : item))}
+              plants={myPlants}
+              online={online}
+              greenhouse={greenhouse}
+              now={now}
+              onStart={(plant) => {
+                if (!greenhouse) return
+                set(ref(db, `greenhouses/${greenhouse.id}/meta/plan`), {
+                  plantId: plant.id,
+                  name: plant.name,
+                  startedAt: Date.now(),
+                  stages: stagesToObject(plant.stages),
+                }).catch((e) => console.error(e))
+              }}
+              onStop={() => {
+                if (!greenhouse) return
+                remove(ref(db, `greenhouses/${greenhouse.id}/meta/plan`)).catch((e) => console.error(e))
+              }}
             />
           )}
           {activeNav === "Plant Library" && (
             <PlantLibraryPage
-              onDownload={(preset) => setDownloadedPlants((items) => items.some((item) => item.name === preset.name) ? items : [...items, preset])}
+              library={library}
+              savedIds={downloadedPlants.map((p) => p.id)}
+              onDownload={(plant) => {
+                if (!user) return
+                set(ref(db, `userPlants/${user.uid}/${plant.id}`), {
+                  name: plant.name,
+                  category: plant.category,
+                  ...(plant.image ? { image: plant.image } : {}),
+                  stages: stagesToObject(plant.stages),
+                }).catch((e) => console.error(e))
+              }}
             />
           )}
-          {activeNav === "Analytics" && (hasDevice ? <AnalyticsPage period={period} setPeriod={setPeriod} /> : <NoDeviceState section="Analytics" onConnect={() => setProfileOpen(true)} />)}
+          {activeNav === "Analytics" && (hasDevice ? <AnalyticsPage history={history} /> : <NoDeviceState section="Analytics" onConnect={() => setProfileOpen(true)} />)}
         </div>
-        <nav className="fixed bottom-[max(0.75rem,env(safe-area-inset-bottom))] left-1/2 z-40 flex w-[calc(100%-2rem)] max-w-sm -translate-x-1/2 items-center rounded-3xl border border-white/70 bg-white/90 p-1.5 shadow-[0_12px_40px_rgb(23_59_44_/_0.18)] backdrop-blur-xl">
+        <nav className="fixed bottom-[max(0.75rem,env(safe-area-inset-bottom))] left-1/2 z-40 flex w-[calc(100%-3rem)] max-w-sm -translate-x-1/2 items-center rounded-3xl border border-white/70 bg-white p-1.5 shadow-[0_12px_40px_rgb(23_59_44_/_0.18)]">
           {navItems.map((item) => (
             <button key={item.label} onClick={() => setActiveNav(item.label)} className={`group flex flex-1 flex-col items-center justify-center gap-0.5 rounded-2xl py-1 text-[8px] font-bold transition-all duration-300 active:scale-90 ${activeNav === item.label ? "nav-active text-forest" : "text-muted hover:text-forest"}`}>
               <span className={`grid size-7 place-items-center rounded-xl transition-all duration-300 ${activeNav === item.label ? "bg-forest text-leaf shadow-md" : "group-hover:bg-canvas"}`}><Icon name={item.icon} size={15} /></span>
@@ -417,15 +677,19 @@ function App() {
         </nav>
       </main>
       {mobileNav && (
-        <div className="fixed inset-0 z-50 flex bg-ink/40 backdrop-blur-sm">
-          <aside className="safe-overlay-panel relative flex h-full w-72 flex-col bg-forest px-5 pb-5 text-white shadow-2xl">
+        <div className="fade-in fixed inset-0 z-50 flex bg-ink/40">
+          <aside className="drawer-in safe-overlay-panel relative flex h-full w-72 flex-col bg-forest px-5 pb-5 text-white shadow-2xl">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-3"><div className="grid size-9 place-items-center rounded-xl bg-leaf text-forest"><Icon name="leaf" size={19} /></div><div><p className="text-sm font-bold">TerraSense</p><p className="text-[10px] text-white/40">Smart greenhouse</p></div></div>
               <button onClick={() => setMobileNav(false)} className="rounded-xl bg-white/10 p-2 text-white/60" aria-label="Close navigation"><Icon name="close" size={18} /></button>
             </div>
             <div className="mt-7 rounded-2xl border border-white/10 bg-white/5 p-4">
               <p className="text-[9px] font-bold uppercase tracking-widest text-white/35">Currently viewing</p>
-              <div className="mt-3 flex items-center gap-3"><span className={`size-2 rounded-full ${greenhouse.status === "Healthy" ? "bg-leaf" : "bg-amber"}`} /><div className="min-w-0"><p className="truncate text-sm font-bold">{greenhouse.name}</p><p className="mt-0.5 truncate text-[10px] text-white/40">{greenhouse.crop} · {greenhouse.location}</p></div></div>
+              {greenhouse ? (
+                <div className="mt-3 flex items-center gap-3"><span className={`size-2 rounded-full ${online ? "bg-leaf" : "bg-amber"}`} /><div className="min-w-0"><p className="truncate text-sm font-bold">{greenhouse.name}</p><p className="mt-0.5 truncate text-[10px] text-white/40">{greenhouse.crop} · {greenhouse.location}</p></div></div>
+              ) : (
+                <p className="mt-3 text-xs text-white/50">No greenhouse added yet</p>
+              )}
             </div>
             <nav className="mt-6 space-y-1">
               {navItems.map((item) => (
@@ -463,13 +727,22 @@ function App() {
           onSignOut={() => { setProfileOpen(false); signOut(auth); setAuthScreen("login") }}
           greenhouses={greenhouses}
           currentGreenhouse={currentGreenhouse}
+          now={now}
           wifiSettings={wifiSettings}
-          onUpdateWifi={(settings) => { setWifiSettings(settings); setHasDevice(true) }}
-          onSwitch={(index) => { setCurrentGreenhouse(index); setStopped(false); setManualMode(false) }}
-          onAdd={(newGreenhouse) => {
-            setGreenhouses((items) => [...items, newGreenhouse])
-            setCurrentGreenhouse(greenhouses.length)
-            setManualMode(false)
+          onUpdateWifi={async (settings) => {
+            if (!user || !greenhouse) return
+            await setDoc(
+              doc(firestore, "users", user.uid, "devices", greenhouse.id),
+              { name: settings.deviceName, greenhouseId: greenhouse.id, ssid: settings.ssid, wifiPassword: settings.password, status: "configured", updatedAt: serverTimestamp() },
+              { merge: true }
+            )
+            setWifiSettings(settings)
+          }}
+          onSwitch={(index) => setCurrentGreenhouse(index)}
+          onAdd={async (input) => {
+            if (!user) throw new Error("You must be signed in to add a greenhouse.")
+            const id = await claimGreenhouse(user.uid, input)
+            setPendingSelect(id)
           }}
         />
       )}
@@ -910,15 +1183,20 @@ function RegisterScreen({
 }
 
 
-function AuthField({ id, label, type, value, onChange, placeholder }: { id: string; label: string; type: string; value: string; onChange: (value: string) => void; placeholder: string }) {
+function AuthField({ id, label, type = "text", value, onChange, placeholder }: { id?: string; label: string; type?: string; value: string; onChange: (value: string) => void; placeholder: string }) {
   return <div><label htmlFor={id} className="text-[10px] font-bold uppercase tracking-widest text-muted">{label}</label><input id={id} type={type} value={value} onChange={(event) => onChange(event.target.value)} required placeholder={placeholder} className="mt-2 w-full rounded-2xl border border-border bg-white px-4 py-3 text-sm outline-none transition placeholder:text-muted/50 focus:border-leaf focus:ring-4 focus:ring-mint" /></div>
 }
 
 function WifiSetupScreen({
   onComplete,
+  onSkip,
 }: {
-  onComplete: (settings: WifiSettings) => void
+  onComplete: (settings: WifiSettings, greenhouseId: string) => void
+  onSkip: () => void
 }) {
+  const [greenhouseId, setGreenhouseId] = useState("")
+  const [claimCode, setClaimCode] = useState("")
+  const [greenhouseName, setGreenhouseName] = useState("")
   const [ssid, setSsid] = useState("")
   const [password, setPassword] = useState("")
   const [deviceName, setDeviceName] = useState("TerraSense Hub")
@@ -927,6 +1205,12 @@ function WifiSetupScreen({
 
   const connectDevice = async (event: React.FormEvent) => {
     event.preventDefault()
+    if (sharing) return
+
+    if (!greenhouseId.trim() || !claimCode.trim()) {
+      setError("Enter the greenhouse ID and claim code from your TerraSense hub.")
+      return
+    }
 
     if (!ssid.trim() || !password) {
       setError("Please enter your Wi-Fi network name and password.")
@@ -944,30 +1228,33 @@ function WifiSetupScreen({
       setSharing(true)
       setError("")
 
-      const deviceId = crypto.randomUUID()
+      // 1) Claim the ESP32 hub so Firebase links it to THIS user
+      const id = await claimGreenhouse(user.uid, {
+        id: greenhouseId,
+        code: claimCode,
+        name: greenhouseName,
+        location: "",
+      })
 
+      // 2) Save the Wi-Fi details for that hub
+      const name = deviceName.trim() || "TerraSense Hub"
       await setDoc(
-        doc(firestore, "users", user.uid, "devices", deviceId),
+        doc(firestore, "users", user.uid, "devices", id),
         {
-          name: deviceName.trim() || "TerraSense Hub",
+          name,
+          greenhouseId: id,
           ssid: ssid.trim(),
           wifiPassword: password,
           status: "configured",
           createdAt: serverTimestamp(),
-        }
+        },
+        { merge: true }
       )
 
-      onComplete({
-        ssid,
-        password,
-        deviceName,
-      })
+      onComplete({ ssid: ssid.trim(), password, deviceName: name }, id)
     } catch (e: any) {
-      console.error("Wi-Fi configuration error:", e)
-      setError(
-        e?.message ||
-          "Unable to save Wi-Fi configuration. Please try again."
-      )
+      console.error("Device setup error:", e)
+      setError(e?.message || "Unable to connect the device. Please try again.")
     } finally {
       setSharing(false)
     }
@@ -984,12 +1271,8 @@ function WifiSetupScreen({
             </div>
 
             <div>
-              <p className="text-lg font-extrabold tracking-tight">
-                TerraSense
-              </p>
-              <p className="text-[10px] text-muted">
-                Device setup
-              </p>
+              <p className="text-lg font-extrabold tracking-tight">TerraSense</p>
+              <p className="text-[10px] text-muted">Device setup</p>
             </div>
           </div>
 
@@ -998,53 +1281,28 @@ function WifiSetupScreen({
           </span>
         </div>
 
-        <div className="mt-12">
+        <div className="mt-10">
           <div className="grid size-14 place-items-center rounded-2xl bg-blue-soft text-blue-ink">
             <Icon name="wifi" size={25} />
           </div>
 
-          <p
-            role="heading"
-            aria-level={1}
-            className="mt-6 text-3xl font-extrabold tracking-tight"
-          >
+          <p role="heading" aria-level={1} className="mt-6 text-3xl font-extrabold tracking-tight">
             Connect your device.
           </p>
 
           <p className="mt-3 text-sm leading-6 text-muted">
-            Enter the Wi-Fi network your TerraSense device should use.
-            These details will be securely shared with your device.
+            Enter the ID and claim code on your TerraSense hub to link it to your account, then the Wi-Fi network it should use.
           </p>
         </div>
 
-        <form onSubmit={connectDevice} className="mt-9 space-y-5">
+        <form onSubmit={connectDevice} className="mt-8 space-y-5">
 
-          <AuthField
-            id="setup-device"
-            label="Device name"
-            type="text"
-            value={deviceName}
-            onChange={setDeviceName}
-            placeholder="TerraSense Hub"
-          />
-
-          <AuthField
-            id="setup-ssid"
-            label="Wi-Fi network name"
-            type="text"
-            value={ssid}
-            onChange={setSsid}
-            placeholder="Enter network SSID"
-          />
-
-          <AuthField
-            id="setup-wifi-password"
-            label="Wi-Fi password"
-            type="password"
-            value={password}
-            onChange={setPassword}
-            placeholder="Enter network password"
-          />
+          <AuthField id="setup-gh-id" label="Greenhouse ID" type="text" value={greenhouseId} onChange={setGreenhouseId} placeholder="TS-GH-XXXX" />
+          <AuthField id="setup-claim-code" label="Claim code" type="text" value={claimCode} onChange={setClaimCode} placeholder="Code shown on your hub" />
+          <AuthField id="setup-gh-name" label="Greenhouse name" type="text" value={greenhouseName} onChange={setGreenhouseName} placeholder="e.g. North greenhouse" />
+          <AuthField id="setup-device" label="Device name" type="text" value={deviceName} onChange={setDeviceName} placeholder="TerraSense Hub" />
+          <AuthField id="setup-ssid" label="Wi-Fi network name" type="text" value={ssid} onChange={setSsid} placeholder="Enter network SSID" />
+          <AuthField id="setup-wifi-password" label="Wi-Fi password" type="password" value={password} onChange={setPassword} placeholder="Enter network password" />
 
           {error && (
             <p className="rounded-2xl bg-red-50 px-4 py-3 text-sm font-medium text-red-600">
@@ -1056,8 +1314,7 @@ function WifiSetupScreen({
             <Icon name="bolt" size={18} />
 
             <p className="text-[10px] leading-4">
-              Keep your TerraSense device powered on and nearby while network
-              details are being shared.
+              Keep your TerraSense device powered on and connected to the internet while it is being linked.
             </p>
           </div>
 
@@ -1069,11 +1326,15 @@ function WifiSetupScreen({
             {sharing ? (
               <>
                 <span className="size-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
-                Saving configuration…
+                Linking device…
               </>
             ) : (
               "Connect TerraSense device"
             )}
+          </button>
+
+          <button type="button" onClick={onSkip} className="w-full py-2 text-xs font-bold text-muted">
+            Skip for now
           </button>
 
         </form>
@@ -1082,171 +1343,167 @@ function WifiSetupScreen({
   )
 }
 
-const plantProfiles: PlantProfile[] = [
-  { name: "Cherry Tomato", stage: "Fruiting", days: "Day 68", temperature: "22–26°C", moisture: "65–80%", image: "https://images.unsplash.com/photo-1592841200221-a6898f307baa?auto=format&fit=crop&w=900&q=80" },
-  { name: "Sweet Basil", stage: "Vegetative", days: "Day 24", temperature: "20–25°C", moisture: "60–70%", image: "https://images.unsplash.com/photo-1600788886242-5c96aabe3757?auto=format&fit=crop&w=900&q=80" },
-  { name: "Butterhead Lettuce", stage: "Maturing", days: "Day 37", temperature: "16–21°C", moisture: "70–80%", image: "https://images.unsplash.com/photo-1622205313162-be1d5712a43f?auto=format&fit=crop&w=900&q=80" },
-]
+const fmtRange = (a: number, b: number, unit: string) => `${a}–${b}${unit}`
 
-function PlantsPage({ downloadedPlants, activePlant, onStart }: { downloadedPlants: PlantProfile[]; activePlant: string | null; onStart: (plant: PlantProfile) => void }) {
-  const [selectedPlant, setSelectedPlant] = useState(0)
+function StageRow({ stage, active }: { stage: StageDef; active: boolean }) {
+  return (
+    <div className={`rounded-2xl border p-4 ${active ? "border-leaf bg-mint/40" : "border-border bg-canvas"}`}>
+      <div className="flex items-center justify-between">
+        <p className="text-sm font-bold">{stage.name}{active && <span className="ml-2 rounded-full bg-forest px-2 py-0.5 text-[9px] font-bold text-white">NOW</span>}</p>
+        <span className="text-[10px] font-bold text-muted">{stage.days} days</span>
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-2 text-[11px]">
+        <span><span className="text-muted">Temp </span><b>{fmtRange(stage.tempMin, stage.tempMax, "°C")}</b></span>
+        <span><span className="text-muted">Soil </span><b>{fmtRange(stage.moistureMin, stage.moistureMax, "%")}</b></span>
+        <span><span className="text-muted">Light </span><b>{stage.lightHours} h/day</b></span>
+        <span><span className="text-muted">Feed </span><b>every {stage.feedEveryDays} d</b></span>
+      </div>
+    </div>
+  )
+}
+
+function PlantsPage({ plants, greenhouse, now, online, onStart, onStop }: {
+  plants: PlantProfile[]
+  greenhouse: Greenhouse | null
+  now: number
+  online: boolean
+  onStart: (plant: PlantProfile) => void
+  onStop: () => void
+}) {
+  const [selected, setSelected] = useState(0)
   const [cycleAlert, setCycleAlert] = useState(false)
-  const availablePlants = [...plantProfiles, ...downloadedPlants]
-  const plant = availablePlants[selectedPlant] ?? availablePlants[0]
+  const [offlineAlert, setOfflineAlert] = useState(false)
+  const plant = plants[selected] ?? plants[0]
+  const active = greenhouse?.plan
+  const cur = currentStage(active, now)
+
+  if (!plant) {
+    return (
+      <section className="grid min-h-[50vh] place-items-center px-5 text-center">
+        <div>
+          <p className="text-lg font-bold">No plant profiles yet</p>
+          <p className="mt-2 text-xs text-muted">Add a plant from the Plant Library to start a growing cycle.</p>
+        </div>
+      </section>
+    )
+  }
 
   const startPlant = () => {
-    if (activePlant) {
-      setCycleAlert(true)
-      return
-    }
+    if (!greenhouse) return
+    if (!online) { setOfflineAlert(true); return }
+    if (active) { setCycleAlert(true); return }
     onStart(plant)
   }
 
+  const isActivePlant = active?.plantId === plant.id
+
   return (
     <section className="space-y-5">
+      {offlineAlert && (
+        <div className="fade-in fixed inset-0 z-50 grid place-items-center bg-ink/50 px-6" role="alertdialog" aria-modal="true">
+          <div className="pop-in w-full max-w-xs rounded-3xl bg-white p-6 text-center shadow-2xl">
+            <div className="mx-auto grid size-14 place-items-center rounded-2xl bg-amber-soft text-amber-ink"><Icon name="wifi" size={26} /></div>
+            <p className="mt-4 text-base font-bold">Device is offline</p>
+            <p className="mt-2 text-xs leading-5 text-muted">Your TerraSense hub isn't connected right now, so the plant cycle can't be started. Check that it is powered on and connected to Wi-Fi, then try again.</p>
+            <button onClick={() => setOfflineAlert(false)} className="mt-5 w-full rounded-xl bg-forest py-3 text-sm font-bold text-white">OK</button>
+          </div>
+        </div>
+      )}
+      {active && cur && (
+        <div className="rounded-2xl border border-leaf/30 bg-mint/40 p-4">
+          <p className="text-xs font-bold text-forest">Active cycle · {active.name}</p>
+          <p className="mt-1 text-[11px] text-muted">{cur.finished ? "All stages complete" : `${cur.stage.name} · Day ${cur.day}`}</p>
+          <button onClick={onStop} className="mt-3 rounded-xl bg-white px-3 py-2 text-xs font-bold text-coral">Stop cycle</button>
+        </div>
+      )}
       {cycleAlert && (
         <div className="rounded-2xl border border-amber/30 bg-amber-soft p-4">
           <div className="flex items-start gap-3">
-            <div className="grid size-9 shrink-0 place-items-center rounded-xl bg-white/60 text-amber-ink"><Icon name="bell" size={17} /></div>
-            <div className="min-w-0 flex-1"><p className="text-xs font-bold text-amber-ink">A plant is already in cycle</p><p className="mt-1 text-[10px] leading-4 text-muted">{activePlant} is currently active in this greenhouse. Finish or stop that cycle before starting {plant.name}.</p></div>
+            <div className="min-w-0 flex-1"><p className="text-xs font-bold text-amber-ink">A plant is already in cycle</p><p className="mt-1 text-[10px] leading-4 text-muted">{active?.name} is running in this greenhouse. Stop that cycle before starting {plant.name}.</p></div>
             <button onClick={() => setCycleAlert(false)} className="text-amber-ink" aria-label="Dismiss cycle alert"><Icon name="close" size={15} /></button>
           </div>
         </div>
       )}
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div><p role="heading" aria-level={2} className="text-2xl font-bold tracking-tight">Plant profiles</p><p className="mt-1 text-sm text-muted">Choose which crop the greenhouse should optimize for.</p></div>
-        <button className="rounded-xl bg-forest px-4 py-2.5 text-xs font-bold text-white">+ Add custom plant</button>
+      <div>
+        <p role="heading" aria-level={2} className="text-2xl font-bold tracking-tight">Plant profiles</p>
+        <p className="mt-1 text-sm text-muted">Each plant carries settings for every growth stage.</p>
       </div>
-      <div className="grid gap-5">
-        <div className="grid gap-4">
-          {availablePlants.map((item, index) => (
-            <button key={`${item.name}-${index}`} onClick={() => setSelectedPlant(index)} className={`overflow-hidden rounded-2xl border bg-white text-left shadow-card transition ${selectedPlant === index ? "border-leaf ring-2 ring-leaf/20" : "border-border hover:-translate-y-0.5"}`}>
-              {item.image ? <img src={item.image} alt={item.name} className="h-36 w-full object-cover" /> : <div className="grid h-28 w-full place-items-center bg-mint text-forest"><Icon name="leaf" size={32} /></div>}
-              <div className="p-4">
-                <div className="flex items-center justify-between"><p className="text-sm font-bold">{item.name}</p>{item.downloaded ? <span className="rounded-full bg-blue-soft px-2 py-1 text-[10px] font-bold text-blue-ink">DOWNLOADED</span> : selectedPlant === index && <span className="rounded-full bg-mint px-2 py-1 text-[10px] font-bold text-forest">SELECTED</span>}</div>
-                <p className="mt-1 text-xs text-muted">{item.stage} · {item.days}</p>
-              </div>
-            </button>
-          ))}
+      <div className="grid gap-4">
+        {plants.map((item, index) => (
+          <button key={item.id} onClick={() => setSelected(index)} className={`overflow-hidden rounded-2xl border bg-white text-left shadow-card transition ${selected === index ? "border-leaf ring-2 ring-leaf/20" : "border-border"}`}>
+            {item.image ? <img src={item.image} alt={item.name} className="h-36 w-full object-cover" /> : <div className="grid h-24 w-full place-items-center bg-mint text-forest"><Icon name="leaf" size={32} /></div>}
+            <div className="p-4">
+              <div className="flex items-center justify-between"><p className="text-sm font-bold">{item.name}</p>{selected === index && <span className="rounded-full bg-mint px-2 py-1 text-[10px] font-bold text-forest">SELECTED</span>}</div>
+              <p className="mt-1 text-xs text-muted">{item.category} · {item.stages.length} stages · {item.stages.reduce((n, st) => n + st.days, 0)} days</p>
+            </div>
+          </button>
+        ))}
+      </div>
+      <div className="rounded-3xl border border-border bg-white p-6 shadow-card">
+        <span className="rounded-full bg-mint px-3 py-1.5 text-[10px] font-bold text-forest">GROWTH STAGES</span>
+        <p role="heading" aria-level={3} className="mt-5 text-2xl font-bold">{plant.name}</p>
+        <div className="mt-5 space-y-3">
+          {plant.stages.map((stage) => <StageRow key={stage.key} stage={stage} active={isActivePlant && !!cur && !cur.finished && cur.stage.key === stage.key} />)}
         </div>
-        <div className="rounded-3xl border border-border bg-white p-6 shadow-card">
-          <span className="rounded-full bg-mint px-3 py-1.5 text-[10px] font-bold text-forest">CURRENT PROFILE</span>
-          <p role="heading" aria-level={3} className="mt-5 text-2xl font-bold">{plant.name}</p>
-          <p className="mt-2 text-sm leading-6 text-muted">Automation settings are tuned for the {plant.stage.toLowerCase()} growth stage.</p>
-          <div className="mt-7 grid grid-cols-2 gap-3">
-            <PlantSetting icon="thermometer" label="Temperature" value={plant.temperature} />
-            <PlantSetting icon="droplet" label="Soil moisture" value={plant.moisture} />
-            <PlantSetting icon="sun" label="Lighting" value="14 hours/day" />
-            <PlantSetting icon="flask" label="Feeding" value="Every 3 days" />
-          </div>
-          <button onClick={startPlant} className="mt-7 w-full rounded-xl bg-forest py-3 text-sm font-bold text-white">Start this plant cycle</button>
-        </div>
+        <button onClick={startPlant} disabled={!greenhouse} className="mt-7 w-full rounded-xl bg-forest py-3 text-sm font-bold text-white disabled:opacity-40">
+          {greenhouse ? "Start this plant cycle" : "Add a greenhouse first"}
+        </button>
       </div>
     </section>
   )
 }
 
-function PlantSetting({ icon, label, value }: { icon: IconName; label: string; value: string }) {
-  return <div className="rounded-2xl bg-canvas p-4"><div className="flex items-center gap-2 text-muted"><Icon name={icon} size={17} /><span className="text-xs font-medium">{label}</span></div><p className="mt-3 text-sm font-bold">{value}</p></div>
-}
-
-const libraryPresets = [
-  { name: "Roma Tomato", category: "Vegetables", stage: "Full lifecycle", temperature: "22–27°C", moisture: "65–80%", light: "14–16 hours", feeding: "Every 3 days", downloads: 1842, color: "bg-coral-soft text-coral" },
-  { name: "English Cucumber", category: "Vegetables", stage: "Full lifecycle", temperature: "21–26°C", moisture: "70–85%", light: "14 hours", feeding: "Every 4 days", downloads: 1268, color: "bg-green-soft text-green-ink" },
-  { name: "Sweet Basil", category: "Herbs", stage: "Full lifecycle", temperature: "20–25°C", moisture: "60–70%", light: "12–14 hours", feeding: "Every 14 days", downloads: 2351, color: "bg-mint text-forest" },
-  { name: "Butterhead Lettuce", category: "Leafy greens", stage: "Full lifecycle", temperature: "16–21°C", moisture: "70–80%", light: "12–14 hours", feeding: "Every 7 days", downloads: 1644, color: "bg-blue-soft text-blue-ink" },
-  { name: "Strawberry", category: "Fruits", stage: "Flowering & fruiting", temperature: "18–24°C", moisture: "65–75%", light: "12–16 hours", feeding: "Every 7 days", downloads: 987, color: "bg-purple-soft text-purple-ink" },
-  { name: "Bell Pepper", category: "Vegetables", stage: "Full lifecycle", temperature: "21–28°C", moisture: "65–75%", light: "14–16 hours", feeding: "Every 5 days", downloads: 1106, color: "bg-amber-soft text-amber-ink" },
-]
-
-function PlantLibraryPage({ onDownload }: { onDownload: (plant: PlantProfile) => void }) {
+function PlantLibraryPage({ library, savedIds, onDownload }: {
+  library: PlantProfile[]
+  savedIds: string[]
+  onDownload: (plant: PlantProfile) => void
+}) {
   const [category, setCategory] = useState("All presets")
-  const [downloaded, setDownloaded] = useState("")
-  const categories = ["All presets", "Vegetables", "Herbs", "Leafy greens", "Fruits"]
-  const visiblePresets = category === "All presets" ? libraryPresets : libraryPresets.filter((preset) => preset.category === category)
-
-  const downloadPreset = (preset: typeof libraryPresets[number]) => {
-    const payload = {
-      name: preset.name,
-      version: "1.0",
-      environmentalConditions: {
-        temperature: preset.temperature,
-        soilMoisture: preset.moisture,
-        dailyLight: preset.light,
-        nutrientSchedule: preset.feeding,
-      },
-      greenhouseMode: "automatic",
-    }
-    const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }))
-    const link = document.createElement("a")
-    link.href = url
-    link.download = `${preset.name.toLowerCase().replaceAll(" ", "-")}-preset.json`
-    link.click()
-    URL.revokeObjectURL(url)
-    onDownload({
-      name: preset.name,
-      stage: preset.stage,
-      days: "Library preset",
-      temperature: preset.temperature,
-      moisture: preset.moisture,
-      downloaded: true,
-    })
-    setDownloaded(preset.name)
-    window.setTimeout(() => setDownloaded(""), 2400)
-  }
+  const categories = ["All presets", ...Array.from(new Set(library.map((p) => p.category)))]
+  const visible = category === "All presets" ? library : library.filter((p) => p.category === category)
 
   return (
     <section className="space-y-6">
       <div className="rounded-3xl bg-forest p-6 text-white shadow-card">
-        <div className="flex flex-col gap-6">
-          <div className="max-w-2xl">
-            <span className="rounded-full bg-white/10 px-3 py-1.5 text-[10px] font-bold tracking-widest text-mint">COMMUNITY PRESETS</span>
-            <p role="heading" aria-level={2} className="mt-5 text-2xl font-bold tracking-tight">Plant Library</p>
-            <p className="mt-2 text-sm leading-6 text-white/60">Download expert greenhouse settings and import them into your automation system.</p>
-          </div>
-          <div className="grid size-20 shrink-0 place-items-center rounded-3xl bg-white/10 text-leaf"><Icon name="book" size={34} /></div>
-        </div>
+        <span className="rounded-full bg-white/10 px-3 py-1.5 text-[10px] font-bold tracking-widest text-mint">PLANT PRESETS</span>
+        <p role="heading" aria-level={2} className="mt-5 text-2xl font-bold tracking-tight">Plant Library</p>
+        <p className="mt-2 text-sm leading-6 text-white/60">Add a plant to your account to use its settings for every growth stage.</p>
       </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <div className="flex flex-wrap gap-2">
-          {categories.map((item) => (
-            <button key={item} onClick={() => setCategory(item)} className={`rounded-full px-4 py-2 text-xs font-bold transition ${category === item ? "bg-forest text-white" : "border border-border bg-white text-muted hover:text-ink"}`}>{item}</button>
-          ))}
-        </div>
-        <p className="text-xs font-medium text-muted">{visiblePresets.length} presets available</p>
+      <div className="flex flex-wrap gap-2">
+        {categories.map((item) => (
+          <button key={item} onClick={() => setCategory(item)} className={`rounded-full px-4 py-2 text-xs font-bold transition ${category === item ? "bg-forest text-white" : "border border-border bg-white text-muted"}`}>{item}</button>
+        ))}
       </div>
+
+      {visible.length === 0 && <p className="text-xs text-muted">No presets available yet.</p>}
 
       <div className="grid gap-4">
-        {visiblePresets.map((preset) => (
-          <div key={preset.name} className="rounded-2xl border border-border bg-white p-5 shadow-card transition hover:-translate-y-0.5 hover:shadow-lg">
-            <div className="flex items-start justify-between">
-              <div className={`grid size-12 place-items-center rounded-2xl ${preset.color}`}><Icon name="leaf" /></div>
-              <span className="rounded-full bg-canvas px-2.5 py-1 text-[10px] font-bold text-muted">{preset.category}</span>
+        {visible.map((plant) => {
+          const saved = savedIds.includes(plant.id)
+          return (
+            <div key={plant.id} className="rounded-2xl border border-border bg-white p-5 shadow-card">
+              {plant.image && <img src={plant.image} alt={plant.name} className="mb-4 h-36 w-full rounded-xl object-cover" />}
+              <div className="flex items-start justify-between">
+                <div className="grid size-12 place-items-center rounded-2xl bg-mint text-forest"><Icon name="leaf" /></div>
+                <span className="rounded-full bg-canvas px-2.5 py-1 text-[10px] font-bold text-muted">{plant.category}</span>
+              </div>
+              <p role="heading" aria-level={3} className="mt-5 text-base font-bold">{plant.name}</p>
+              <p className="mt-1 text-xs text-muted">{plant.stages.length} stages · {plant.stages.reduce((n, st) => n + st.days, 0)} days</p>
+              <div className="mt-4 flex flex-wrap gap-2">
+                {plant.stages.map((st) => <span key={st.key} className="rounded-full bg-canvas px-2.5 py-1 text-[10px] font-bold text-muted">{st.name} · {st.days}d</span>)}
+              </div>
+              <div className="mt-5 border-t border-border pt-4">
+                <button onClick={() => onDownload(plant)} disabled={saved} className={`w-full rounded-xl px-4 py-2.5 text-xs font-bold transition ${saved ? "bg-mint text-forest" : "bg-forest text-white"}`}>
+                  {saved ? "Added to my plants" : "Add to my plants"}
+                </button>
+              </div>
             </div>
-            <p role="heading" aria-level={3} className="mt-5 text-base font-bold">{preset.name}</p>
-            <p className="mt-1 text-xs text-muted">{preset.stage}</p>
-            <div className="mt-5 grid grid-cols-2 gap-3">
-              <LibraryDetail label="Temperature" value={preset.temperature} />
-              <LibraryDetail label="Moisture" value={preset.moisture} />
-              <LibraryDetail label="Daily light" value={preset.light} />
-              <LibraryDetail label="Feeding" value={preset.feeding} />
-            </div>
-            <div className="mt-5 flex items-center justify-between border-t border-border pt-4">
-              <span className="text-[10px] font-medium text-muted">{preset.downloads.toLocaleString()} downloads</span>
-              <button onClick={() => downloadPreset(preset)} className={`rounded-xl px-4 py-2 text-xs font-bold transition ${downloaded === preset.name ? "bg-mint text-forest" : "bg-forest text-white hover:bg-leaf"}`}>
-                {downloaded === preset.name ? "Downloaded" : "Download preset"}
-              </button>
-            </div>
-          </div>
-        ))}
+          )
+        })}
       </div>
     </section>
   )
-}
-
-function LibraryDetail({ label, value }: { label: string; value: string }) {
-  return <div className="rounded-xl bg-canvas p-3"><p className="text-[10px] font-medium text-muted">{label}</p><p className="mt-1 text-xs font-bold">{value}</p></div>
 }
 
 function NoDeviceState({ section, onConnect }: { section: "Overview" | "Analytics"; onConnect: () => void }) {
@@ -1264,14 +1521,21 @@ function NoDeviceState({ section, onConnect }: { section: "Overview" | "Analytic
   )
 }
 
-function AnalyticsPage({ period, setPeriod }: { period: string; setPeriod: (value: string) => void }) {
+function AnalyticsPage({ history }: { history: number[] }) {
+  const has = history.length > 0
+  const avg = has ? history.reduce((a, b) => a + b, 0) / history.length : 0
+  const fmt = (n: number) => `${(Math.round(n * 10) / 10).toString()}°C`
   return (
     <section className="space-y-5">
-      <div><p role="heading" aria-level={2} className="text-2xl font-bold tracking-tight">Greenhouse analytics</p><p className="mt-1 text-sm text-muted">Historical performance and resource insights.</p></div>
-      <div className="grid gap-4"><Metric label="Average temperature" value="24.2°C" detail="+0.4° this week" /><Metric label="Water used" value="84 L" detail="-12% this week" /><Metric label="Healthy uptime" value="99.8%" detail="Last 30 days" /></div>
+      <div><p role="heading" aria-level={2} className="text-2xl font-bold tracking-tight">Greenhouse analytics</p><p className="mt-1 text-sm text-muted">Based on readings recorded by your TerraSense hub.</p></div>
+      <div className="grid gap-4">
+        <Metric label="Average temperature" value={has ? fmt(avg) : "—"} detail={has ? `Last ${history.length} readings` : "No readings yet"} />
+        <Metric label="Highest temperature" value={has ? fmt(Math.max(...history)) : "—"} detail={has ? `Last ${history.length} readings` : "No readings yet"} />
+        <Metric label="Lowest temperature" value={has ? fmt(Math.min(...history)) : "—"} detail={has ? `Last ${history.length} readings` : "No readings yet"} />
+      </div>
       <div className="rounded-3xl border border-border bg-white p-6 shadow-card">
-        <div className="flex items-center justify-between"><p className="text-base font-bold">Temperature history</p><div className="flex rounded-xl bg-canvas p-1">{Object.keys(chartValues).map((item) => <button key={item} onClick={() => setPeriod(item)} className={`rounded-lg px-3 py-1.5 text-xs font-bold ${period === item ? "bg-white text-forest shadow-sm" : "text-muted"}`}>{item}</button>)}</div></div>
-        <div className="mt-8"><Sparkline values={chartValues[period]} /></div>
+        <p className="text-base font-bold">Temperature history</p>
+        <div className="mt-8"><Sparkline values={history} /></div>
       </div>
     </section>
   )
@@ -1290,15 +1554,17 @@ function ProfilePanel({
   onAdd,
   wifiSettings,
   onUpdateWifi,
+  now,
 }: {
   onClose: () => void
   onSignOut: () => void
   greenhouses: Greenhouse[]
   currentGreenhouse: number
   onSwitch: (index: number) => void
-  onAdd: (greenhouse: Greenhouse) => void
+  onAdd: (input: { id: string; code: string; name: string; location: string }) => Promise<void>
   wifiSettings: WifiSettings
-  onUpdateWifi: (settings: WifiSettings) => void
+  onUpdateWifi: (settings: WifiSettings) => Promise<void>
+  now: number
 }) {
   const [notifications, setNotifications] = useState(true)
   const [addingGreenhouse, setAddingGreenhouse] = useState(false)
@@ -1317,6 +1583,10 @@ function ProfilePanel({
 
   const [wifiSynced, setWifiSynced] = useState(true)
   const [newGreenhouseId, setNewGreenhouseId] = useState("")
+  const [newGreenhouseCode, setNewGreenhouseCode] = useState("")
+  const [newGreenhouseName, setNewGreenhouseName] = useState("")
+  const [newGreenhouseLocation, setNewGreenhouseLocation] = useState("")
+  const [claiming, setClaiming] = useState(false)
   const [greenhouseError, setGreenhouseError] = useState("")
   const [profileImageFailed, setProfileImageFailed] = useState(false)
 
@@ -1331,39 +1601,48 @@ function ProfilePanel({
     .slice(0, 2)
     .toUpperCase()
 
-  const addGreenhouse = () => {
+  const addGreenhouse = async () => {
     const id = newGreenhouseId.trim().toUpperCase()
 
-    if (!/^TS-GH-[A-Z0-9]{4,}$/.test(id)) {
-      setGreenhouseError(
-        "Enter a valid ID in the format TS-GH-XXXX."
-      )
+    if (!GH_ID_PATTERN.test(id)) {
+      setGreenhouseError("Enter a valid ID in the format TS-GH-XXXX.")
+      return
+    }
+
+    if (!newGreenhouseCode.trim()) {
+      setGreenhouseError("Enter the claim code shown on your TerraSense hub.")
       return
     }
 
     if (greenhouses.some((greenhouse) => greenhouse.id === id)) {
-      setGreenhouseError(
-        "This greenhouse has already been added to your account."
-      )
+      setGreenhouseError("This greenhouse has already been added to your account.")
       return
     }
 
-    onAdd({
-      id,
-      name: `Greenhouse ${greenhouses.length + 1}`,
-      location: "Location not set",
-      crop: "No crop selected",
-      stage: "Setup",
-      devices: 1,
-      status: "Attention",
-    })
+    try {
+      setClaiming(true)
+      setGreenhouseError("")
 
-    setNewGreenhouseId("")
-    setGreenhouseError("")
-    setAddingGreenhouse(false)
+      await onAdd({
+        id,
+        code: newGreenhouseCode,
+        name: newGreenhouseName,
+        location: newGreenhouseLocation,
+      })
+
+      setNewGreenhouseId("")
+      setNewGreenhouseCode("")
+      setNewGreenhouseName("")
+      setNewGreenhouseLocation("")
+      setAddingGreenhouse(false)
+    } catch (e: any) {
+      setGreenhouseError(e?.message || "Unable to add this greenhouse. Please try again.")
+    } finally {
+      setClaiming(false)
+    }
   }
 
-  const saveWifi = () => {
+  const saveWifi = async () => {
     const deviceName = wifiDraft.deviceName.trim()
     const ssid = wifiDraft.ssid.trim()
     const password = wifiDraft.password
@@ -1372,19 +1651,20 @@ function ProfilePanel({
       return
     }
 
-    const updatedSettings: WifiSettings = {
-      deviceName: deviceName || "TerraSense Hub",
-      ssid,
-      password,
-    }
-
     setWifiSynced(false)
 
-    window.setTimeout(() => {
-      onUpdateWifi(updatedSettings)
-      setWifiSynced(true)
+    try {
+      await onUpdateWifi({
+        deviceName: deviceName || "TerraSense Hub",
+        ssid,
+        password,
+      })
       setEditingWifi(false)
-    }, 900)
+    } catch (e) {
+      console.error("Wi-Fi save error:", e)
+    } finally {
+      setWifiSynced(true)
+    }
   }
 
   const startWifiEdit = () => {
@@ -1398,8 +1678,8 @@ function ProfilePanel({
   }
 
   return (
-    <div className="fixed inset-0 z-50 bg-ink/40 backdrop-blur-sm">
-      <div className="absolute inset-y-0 right-0 flex w-full max-w-xl flex-col overflow-hidden bg-white shadow-2xl">
+    <div className="fade-in fixed inset-0 z-50 bg-ink/40">
+      <div className="drawer-in-right absolute inset-y-0 right-0 flex w-full max-w-xl flex-col overflow-hidden bg-white shadow-2xl">
 
         {/* Header */}
         <div className="flex items-center justify-between border-b border-black/10 px-6 py-5">
@@ -1496,19 +1776,14 @@ function ProfilePanel({
                 </p>
 
                 <p className="mt-1 text-xs text-black/40">
-                  Enter the greenhouse ID shown on your TerraSense Hub.
+                  Enter the greenhouse ID and claim code shown on your TerraSense Hub.
                 </p>
 
-                <div className="mt-3">
-                  <input
-                    value={newGreenhouseId}
-                    onChange={(event) => {
-                      setNewGreenhouseId(event.target.value)
-                      setGreenhouseError("")
-                    }}
-                    placeholder="TS-GH-XXXX"
-                    className="w-full rounded-xl border border-black/10 bg-white px-4 py-3 text-sm font-medium outline-none transition focus:border-forest"
-                  />
+                <div className="mt-3 space-y-3">
+                  <AuthField label="Greenhouse ID" value={newGreenhouseId} onChange={(value) => { setNewGreenhouseId(value); setGreenhouseError("") }} placeholder="TS-GH-XXXX" />
+                  <AuthField label="Claim code" value={newGreenhouseCode} onChange={(value) => { setNewGreenhouseCode(value); setGreenhouseError("") }} placeholder="Code shown on your hub" />
+                  <AuthField label="Greenhouse name" value={newGreenhouseName} onChange={setNewGreenhouseName} placeholder="e.g. North greenhouse" />
+                  <AuthField label="Location" value={newGreenhouseLocation} onChange={setNewGreenhouseLocation} placeholder="e.g. Backyard" />
                 </div>
 
                 {greenhouseError && (
@@ -1520,15 +1795,19 @@ function ProfilePanel({
                 <div className="mt-3 flex gap-2">
                   <button
                     onClick={addGreenhouse}
-                    className="flex-1 rounded-xl bg-forest px-4 py-3 text-sm font-bold text-white"
+                    disabled={claiming}
+                    className="flex-1 rounded-xl bg-forest px-4 py-3 text-sm font-bold text-white disabled:opacity-60"
                   >
-                    Add greenhouse
+                    {claiming ? "Linking…" : "Add greenhouse"}
                   </button>
 
                   <button
                     onClick={() => {
                       setAddingGreenhouse(false)
                       setNewGreenhouseId("")
+                      setNewGreenhouseCode("")
+                      setNewGreenhouseName("")
+                      setNewGreenhouseLocation("")
                       setGreenhouseError("")
                     }}
                     className="rounded-xl bg-black/5 px-4 py-3 text-sm font-bold text-ink"
@@ -1608,12 +1887,12 @@ function ProfilePanel({
 
                         <span
                           className={`rounded-full px-2 py-1 ${
-                            greenhouse.status === "Healthy"
+                            isOnline(greenhouse.lastSeen, now)
                               ? "bg-green-100 text-green-700"
                               : "bg-orange-100 text-orange-700"
                           }`}
                         >
-                          {greenhouse.status}
+                          {isOnline(greenhouse.lastSeen, now) ? "Online" : "Offline"}
                         </span>
                       </div>
                     </button>
@@ -1636,7 +1915,7 @@ function ProfilePanel({
                 </p>
               </div>
 
-              {!editingWifi && (
+              {!editingWifi && greenhouses.length > 0 && (
                 <button
                   onClick={startWifiEdit}
                   className="rounded-xl bg-black/5 px-3 py-2 text-xs font-bold text-ink transition hover:bg-black/10"
@@ -1868,18 +2147,18 @@ function ProfilePanel({
 
 
 
-function SensorCard({ label, value, unit, target, icon, tone, progress }: typeof sensors[number]) {
+function SensorCard({ label, value, unit, icon, tone, progress }: { label: string; value: string; unit: string; icon: IconName; tone: string; progress: number }) {
   const colors = toneClasses[tone]
+  const hasValue = value !== "—"
   return (
     <div className="rounded-2xl border border-border bg-white p-5 shadow-card transition hover:-translate-y-0.5 hover:shadow-lg">
       <div className="flex items-start justify-between">
         <div className={`grid size-10 place-items-center rounded-xl ${colors.soft} ${colors.ink}`}><Icon name={icon} size={19} /></div>
-        <span className="flex items-center gap-1.5 text-[10px] font-bold text-leaf"><span className="size-1.5 rounded-full bg-leaf" /> OPTIMAL</span>
+        <span className={`flex items-center gap-1.5 text-[10px] font-bold ${hasValue ? "text-leaf" : "text-muted"}`}><span className={`size-1.5 rounded-full ${hasValue ? "bg-leaf" : "bg-border"}`} />{hasValue ? "LIVE" : "NO DATA"}</span>
       </div>
       <p className="mt-5 text-xs font-medium text-muted">{label}</p>
-      <p className="mt-1 text-3xl font-bold tracking-tight">{value}<span className="ml-1 text-sm font-semibold text-muted">{unit}</span></p>
+      <p className="mt-1 text-3xl font-bold tracking-tight">{value}{hasValue && <span className="ml-1 text-sm font-semibold text-muted">{unit}</span>}</p>
       <div className="mt-4 h-1.5 rounded-full bg-canvas"><div className={`h-full rounded-full ${colors.fill}`} style={{ width: `${progress}%` }} /></div>
-      <p className="mt-2 text-[10px] text-muted">{target}</p>
     </div>
   )
 }
