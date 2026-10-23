@@ -8,7 +8,7 @@ import {
 } from "firebase/auth"
 import { auth, db, firestore } from "./firebase"
 import { doc, setDoc, getDoc, serverTimestamp } from "firebase/firestore"
-import { ref, onValue, set, remove, query, limitToLast } from "firebase/database"
+import { ref, onValue, set, remove, update, query, limitToLast } from "firebase/database"
 
 
 
@@ -73,6 +73,25 @@ async function claimGreenhouse(
   }
 
   return id
+}
+
+/**
+ * Unlinks a greenhouse from the signed-in user.
+ * Order matters: the database rules check ownerUid, so it is removed last.
+ */
+async function unlinkGreenhouse(uid: string, id: string) {
+  const base = `greenhouses/${id}`
+  try {
+    await remove(ref(db, `userGreenhouses/${uid}/${id}`))
+    await remove(ref(db, `${base}/controls`))
+    await remove(ref(db, `${base}/live`))
+    await remove(ref(db, `${base}/history`))
+    await remove(ref(db, `${base}/meta`))
+    await remove(ref(db, `${base}/ownerUid`))
+  } catch (e) {
+    if (isPermissionError(e)) throw new Error("You don't have permission to remove this greenhouse.")
+    throw e
+  }
 }
 
 function authMessage(e: any) {
@@ -276,6 +295,30 @@ function Sparkline({ values }: { values: number[] }) {
   )
 }
 
+/**
+ * Keeps a panel mounted long enough to play its closing animation.
+ * mounted = render it at all, shown = it is in its open position.
+ */
+function usePresence(open: boolean, ms = 300) {
+  const [mounted, setMounted] = useState(open)
+  const [shown, setShown] = useState(false)
+
+  useEffect(() => {
+    if (open) {
+      setMounted(true)
+      // wait two frames so the closed position is painted before sliding in
+      let second = 0
+      const first = requestAnimationFrame(() => { second = requestAnimationFrame(() => setShown(true)) })
+      return () => { cancelAnimationFrame(first); cancelAnimationFrame(second) }
+    }
+    setShown(false)
+    const timer = window.setTimeout(() => setMounted(false), ms)
+    return () => window.clearTimeout(timer)
+  }, [open, ms])
+
+  return { mounted, shown }
+}
+
 function App() {
   const [authScreen, setAuthScreen] = useState<"app" | "splash" | "login" | "register" | "setup">("splash")
   const [activeNav, setActiveNav] = useState("Overview")
@@ -295,6 +338,7 @@ function App() {
   const [ghIds, setGhIds] = useState<string[]>([])
   const [ghMeta, setGhMeta] = useState<Record<string, any>>({})
   const [ghSeen, setGhSeen] = useState<Record<string, number>>({})
+  const [ghLoaded, setGhLoaded] = useState(false)
 
   // Live data for the greenhouse currently selected
   const [live, setLive] = useState<LiveData | null>(null)
@@ -336,6 +380,16 @@ function App() {
   const greenhouse: Greenhouse | null = greenhouses[currentGreenhouse] ?? null
   const currentId = greenhouse?.id
   const hasDevice = !!greenhouse
+  const loading = !!user && (!ghLoaded || ghIds.some((id) => ghMeta[id] === undefined))
+
+  // Current growth stage and its target ranges
+  const cycle = currentStage(greenhouse?.plan, now)
+  const targetFor = (key: string): { min: number; max: number } | undefined => {
+    if (!cycle || cycle.finished) return undefined
+    if (key === "temperature") return { min: cycle.stage.tempMin, max: cycle.stage.tempMax }
+    if (key === "soilMoisture") return { min: cycle.stage.moistureMin, max: cycle.stage.moistureMax }
+    return undefined
+  }
   const online = isOnline(greenhouse?.lastSeen, now)
   const stopped = controlState.emergencyStop === true
   const manualMode = controlState.manual === true
@@ -366,31 +420,41 @@ function App() {
     }
   }, [profileOpen, mobileNav])
 
+  const navPresence = usePresence(mobileNav)
+  const profilePresence = usePresence(profileOpen)
+
   // 1) The list of greenhouses: ONLY the ones indexed under this user's uid
   useEffect(() => {
     if (!user) {
       setGhIds([])
       setGhMeta({})
       setGhSeen({})
+      setGhLoaded(false)
       return
     }
+    setGhLoaded(false)
     const offs = new Map<string, () => void>()
     const offIndex = onValue(
       ref(db, `userGreenhouses/${user.uid}`),
       (snap) => {
         const ids = Object.keys(snap.val() ?? {}).sort()
         setGhIds(ids)
+        setGhLoaded(true)
         offs.forEach((off, id) => {
           if (!ids.includes(id)) { off(); offs.delete(id) }
         })
         ids.forEach((id) => {
           if (offs.has(id)) return
-          const offMeta = onValue(ref(db, `greenhouses/${id}/meta`), (s) => setGhMeta((m) => ({ ...m, [id]: s.val() ?? {} })))
+          const offMeta = onValue(
+            ref(db, `greenhouses/${id}/meta`),
+            (s) => setGhMeta((m) => ({ ...m, [id]: s.val() ?? {} })),
+            (e) => { console.error("Greenhouse meta error:", e); setGhMeta((m) => ({ ...m, [id]: m[id] ?? {} })) }
+          )
           const offSeen = onValue(ref(db, `greenhouses/${id}/live/updatedAt`), (s) => setGhSeen((m) => ({ ...m, [id]: Number(s.val()) || 0 })))
           offs.set(id, () => { offMeta(); offSeen() })
         })
       },
-      (err) => console.error("Greenhouse list error:", err)
+      (err) => { console.error("Greenhouse list error:", err); setGhLoaded(true) }
     )
     return () => {
       offIndex()
@@ -550,7 +614,7 @@ function App() {
             </div>
           )}
 
-          {activeNav === "Overview" && (hasDevice ? <>
+          {activeNav === "Overview" && (loading ? <LoadingState /> : hasDevice ? <>
           <section className="grid gap-5">
             <div className="relative min-h-72 overflow-hidden rounded-3xl bg-forest text-white shadow-card">
               <img className="absolute inset-0 h-full w-full object-cover opacity-45 mix-blend-luminosity" src="https://images.unsplash.com/photo-1656740840036-7744c5bce4fc?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&q=80&w=1400" alt="Rows of thriving plants inside a greenhouse" />
@@ -582,6 +646,8 @@ function App() {
             </div>
           </section>
 
+          {greenhouse?.plan && cycle && <StageTimeline plan={greenhouse.plan} cycle={cycle} />}
+
           <section>
             <div className="mb-4 flex items-end justify-between">
               <div><p role="heading" aria-level={2} className="text-lg font-bold tracking-tight">Live conditions</p><p className="mt-1 text-xs text-muted">Live from your TerraSense hub</p></div>
@@ -590,7 +656,7 @@ function App() {
             <div className="grid gap-4">
               {sensorDefs.map((def) => {
                 const v = live?.[def.key]
-                return <SensorCard key={def.key} label={def.label} unit={def.unit} icon={def.icon} tone={def.tone} value={typeof v === "number" ? String(Math.round(v * 10) / 10) : "—"} progress={typeof v === "number" ? Math.max(0, Math.min(100, (v / def.max) * 100)) : 0} />
+                return <SensorCard key={def.key} target={targetFor(def.key)} label={def.label} unit={def.unit} icon={def.icon} tone={def.tone} value={typeof v === "number" ? String(Math.round(v * 10) / 10) : "—"} progress={typeof v === "number" ? Math.max(0, Math.min(100, (v / def.max) * 100)) : 0} />
               })}
             </div>
           </section>
@@ -663,7 +729,7 @@ function App() {
               }}
             />
           )}
-          {activeNav === "Analytics" && (hasDevice ? <AnalyticsPage history={history} /> : <NoDeviceState section="Analytics" onConnect={() => setProfileOpen(true)} />)}
+          {activeNav === "Analytics" && (loading ? <LoadingState /> : hasDevice ? <AnalyticsPage history={history} /> : <NoDeviceState section="Analytics" onConnect={() => setProfileOpen(true)} />)}
         </div>
         <nav className="fixed bottom-[max(0.75rem,env(safe-area-inset-bottom))] left-1/2 z-40 flex w-[calc(100%-3rem)] max-w-sm -translate-x-1/2 items-center rounded-3xl border border-white/70 bg-white p-1.5 shadow-[0_12px_40px_rgb(23_59_44_/_0.18)]">
           {navItems.map((item) => (
@@ -676,9 +742,9 @@ function App() {
           ))}
         </nav>
       </main>
-      {mobileNav && (
-        <div className="fade-in fixed inset-0 z-50 flex bg-ink/40">
-          <aside className="drawer-in safe-overlay-panel relative flex h-full w-72 flex-col bg-forest px-5 pb-5 text-white shadow-2xl">
+      {navPresence.mounted && (
+        <div className={`fixed inset-0 z-50 flex bg-ink/40 transition-opacity duration-300 motion-reduce:transition-none ${navPresence.shown ? "opacity-100" : "opacity-0"}`}>
+          <aside className={`safe-overlay-panel relative flex h-full w-72 flex-col bg-forest px-5 pb-5 text-white shadow-2xl transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] will-change-transform motion-reduce:transition-none ${navPresence.shown ? "translate-x-0" : "-translate-x-full"}`}>
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-3"><div className="grid size-9 place-items-center rounded-xl bg-leaf text-forest"><Icon name="leaf" size={19} /></div><div><p className="text-sm font-bold">TerraSense</p><p className="text-[10px] text-white/40">Smart greenhouse</p></div></div>
               <button onClick={() => setMobileNav(false)} className="rounded-xl bg-white/10 p-2 text-white/60" aria-label="Close navigation"><Icon name="close" size={18} /></button>
@@ -721,8 +787,9 @@ function App() {
           <button onClick={() => setMobileNav(false)} className="h-full flex-1" aria-label="Close navigation overlay" />
         </div>
       )}
-      {profileOpen && (
+      {profilePresence.mounted && (
         <ProfilePanel
+          shown={profilePresence.shown}
           onClose={() => setProfileOpen(false)}
           onSignOut={() => { setProfileOpen(false); signOut(auth); setAuthScreen("login") }}
           greenhouses={greenhouses}
@@ -739,6 +806,18 @@ function App() {
             setWifiSettings(settings)
           }}
           onSwitch={(index) => setCurrentGreenhouse(index)}
+          onEdit={async (id, data) => {
+            try {
+              await update(ref(db, `greenhouses/${id}/meta`), { name: data.name, location: data.location || "Location not set" })
+            } catch (e) {
+              if (isPermissionError(e)) throw new Error("You don't have permission to change this greenhouse.")
+              throw e
+            }
+          }}
+          onRemove={async (id) => {
+            if (!user) throw new Error("You must be signed in to remove a greenhouse.")
+            await unlinkGreenhouse(user.uid, id)
+          }}
           onAdd={async (input) => {
             if (!user) throw new Error("You must be signed in to add a greenhouse.")
             const id = await claimGreenhouse(user.uid, input)
@@ -1506,6 +1585,61 @@ function PlantLibraryPage({ library, savedIds, onDownload }: {
   )
 }
 
+function LoadingState() {
+  return (
+    <section className="grid min-h-[50vh] place-items-center text-center">
+      <div>
+        <div className="mx-auto size-8 animate-spin rounded-full border-2 border-border border-t-forest" />
+        <p className="mt-4 text-xs text-muted">Loading your greenhouses…</p>
+      </div>
+    </section>
+  )
+}
+
+function StageTimeline({ plan, cycle }: { plan: PlanView; cycle: NonNullable<ReturnType<typeof currentStage>> }) {
+  const total = plan.stages.reduce((n, st) => n + st.days, 0)
+  const index = plan.stages.findIndex((st) => st.key === cycle.stage.key)
+  const startOfStage = plan.stages.slice(0, Math.max(index, 0)).reduce((n, st) => n + st.days, 0)
+  const dayInStage = cycle.finished ? cycle.stage.days : Math.max(1, cycle.day - startOfStage)
+  const daysLeftInStage = cycle.finished ? 0 : Math.max(0, cycle.stage.days - dayInStage)
+  const next = plan.stages[index + 1]
+  const daysLeftInCycle = Math.max(0, total - Math.min(cycle.day, total))
+  const plural = (n: number) => `${n} day${n === 1 ? "" : "s"}`
+
+  return (
+    <section className="rounded-3xl border border-border bg-white p-6 shadow-card">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-muted">Growth cycle · {plan.name}</p>
+          <p role="heading" aria-level={2} className="mt-2 text-lg font-bold tracking-tight">
+            {cycle.finished ? "All stages complete" : `${cycle.stage.name} · Day ${dayInStage} of ${cycle.stage.days}`}
+          </p>
+          <p className="mt-1 text-xs text-muted">
+            {cycle.finished
+              ? "Ready to harvest, or start a new cycle."
+              : next
+                ? `${plural(daysLeftInStage)} until ${next.name}`
+                : `${plural(daysLeftInStage)} until harvest`}
+          </p>
+        </div>
+        <span className="shrink-0 rounded-full bg-mint px-3 py-1.5 text-[10px] font-bold text-forest">{cycle.finished ? "DONE" : `${plural(daysLeftInCycle)} left`}</span>
+      </div>
+
+      <div className="mt-5 flex gap-1">
+        {plan.stages.map((st, i) => {
+          const fill = cycle.finished || i < index ? 100 : i === index ? Math.min(100, (dayInStage / (st.days || 1)) * 100) : 0
+          return (
+            <div key={st.key} style={{ flexGrow: st.days || 1, flexBasis: 0 }} className="min-w-0">
+              <div className="h-2 overflow-hidden rounded-full bg-canvas"><div className="h-full rounded-full bg-leaf" style={{ width: `${fill}%` }} /></div>
+              <p className={`mt-2 truncate text-[10px] font-bold ${i === index && !cycle.finished ? "text-forest" : "text-muted"}`}>{st.name}</p>
+            </div>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
+
 function NoDeviceState({ section, onConnect }: { section: "Overview" | "Analytics"; onConnect: () => void }) {
   return (
     <section className="flex min-h-[58vh] flex-col items-center justify-center px-5 text-center">
@@ -1546,22 +1680,28 @@ function Metric({ label, value, detail }: { label: string; value: string; detail
 }
 
 function ProfilePanel({
+  shown,
   onClose,
   onSignOut,
   greenhouses,
   currentGreenhouse,
   onSwitch,
   onAdd,
+  onEdit,
+  onRemove,
   wifiSettings,
   onUpdateWifi,
   now,
 }: {
+  shown: boolean
   onClose: () => void
   onSignOut: () => void
   greenhouses: Greenhouse[]
   currentGreenhouse: number
   onSwitch: (index: number) => void
   onAdd: (input: { id: string; code: string; name: string; location: string }) => Promise<void>
+  onEdit: (id: string, data: { name: string; location: string }) => Promise<void>
+  onRemove: (id: string) => Promise<void>
   wifiSettings: WifiSettings
   onUpdateWifi: (settings: WifiSettings) => Promise<void>
   now: number
@@ -1588,6 +1728,11 @@ function ProfilePanel({
   const [newGreenhouseLocation, setNewGreenhouseLocation] = useState("")
   const [claiming, setClaiming] = useState(false)
   const [greenhouseError, setGreenhouseError] = useState("")
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editName, setEditName] = useState("")
+  const [editLocation, setEditLocation] = useState("")
+  const [removingId, setRemovingId] = useState<string | null>(null)
+  const [busyId, setBusyId] = useState<string | null>(null)
   const [profileImageFailed, setProfileImageFailed] = useState(false)
 
   const initials = (
@@ -1642,6 +1787,41 @@ function ProfilePanel({
     }
   }
 
+  const startEdit = (item: Greenhouse) => {
+    setEditingId(item.id)
+    setEditName(item.name)
+    setEditLocation(item.location === "Location not set" ? "" : item.location)
+    setRemovingId(null)
+    setGreenhouseError("")
+  }
+
+  const saveEdit = async (id: string) => {
+    if (!editName.trim()) { setGreenhouseError("Give the greenhouse a name."); return }
+    try {
+      setBusyId(id)
+      setGreenhouseError("")
+      await onEdit(id, { name: editName.trim(), location: editLocation.trim() })
+      setEditingId(null)
+    } catch (e: any) {
+      setGreenhouseError(e?.message || "Couldn't save the changes. Please try again.")
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const confirmRemove = async (id: string) => {
+    try {
+      setBusyId(id)
+      setGreenhouseError("")
+      await onRemove(id)
+      setRemovingId(null)
+    } catch (e: any) {
+      setGreenhouseError(e?.message || "Couldn't remove the greenhouse. Please try again.")
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   const saveWifi = async () => {
     const deviceName = wifiDraft.deviceName.trim()
     const ssid = wifiDraft.ssid.trim()
@@ -1678,8 +1858,8 @@ function ProfilePanel({
   }
 
   return (
-    <div className="fade-in fixed inset-0 z-50 bg-ink/40">
-      <div className="drawer-in-right absolute inset-y-0 right-0 flex w-full max-w-xl flex-col overflow-hidden bg-white shadow-2xl">
+    <div className={`fixed inset-0 z-50 bg-ink/40 transition-opacity duration-300 motion-reduce:transition-none ${shown ? "opacity-100" : "opacity-0"}`}>
+      <div className={`absolute inset-y-0 right-0 flex w-full max-w-xl flex-col overflow-hidden bg-white shadow-2xl transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] will-change-transform motion-reduce:transition-none ${shown ? "translate-x-0" : "translate-x-full"}`}>
 
         {/* Header */}
         <div className="flex items-center justify-between border-b border-black/10 px-6 py-5">
@@ -1818,6 +1998,7 @@ function ProfilePanel({
               </div>
             )}
 
+            {!addingGreenhouse && greenhouseError && <p className="mb-3 text-xs font-medium text-red-500">{greenhouseError}</p>}
             <div className="space-y-3">
               {greenhouses.length === 0 ? (
                 <div className="rounded-2xl border border-dashed border-black/10 p-5 text-center">
@@ -1834,10 +2015,13 @@ function ProfilePanel({
                   const isCurrent = index === currentGreenhouse
 
                   return (
-                    <button
+                    <div
+                      role="button"
+                      tabIndex={0}
                       key={`${greenhouse.id}-${index}`}
                       onClick={() => onSwitch(index)}
-                      className={`w-full rounded-2xl border p-4 text-left transition ${
+                      onKeyDown={(e) => { if (e.key === "Enter") onSwitch(index) }}
+                      className={`w-full cursor-pointer rounded-2xl border p-4 text-left transition ${
                         isCurrent
                           ? "border-forest bg-forest/[0.06]"
                           : "border-black/10 bg-white hover:bg-black/[0.025]"
@@ -1895,7 +2079,36 @@ function ProfilePanel({
                           {isOnline(greenhouse.lastSeen, now) ? "Online" : "Offline"}
                         </span>
                       </div>
-                    </button>
+
+                      <div className="mt-3" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+                        {editingId === greenhouse.id ? (
+                          <div className="space-y-3 border-t border-black/10 pt-3">
+                            <AuthField label="Greenhouse name" value={editName} onChange={setEditName} placeholder="e.g. North greenhouse" />
+                            <AuthField label="Location" value={editLocation} onChange={setEditLocation} placeholder="e.g. Backyard" />
+                            {greenhouseError && <p className="text-xs font-medium text-red-500">{greenhouseError}</p>}
+                            <div className="flex gap-2">
+                              <button onClick={() => saveEdit(greenhouse.id)} disabled={busyId === greenhouse.id} className="flex-1 rounded-xl bg-forest px-4 py-2.5 text-xs font-bold text-white disabled:opacity-60">{busyId === greenhouse.id ? "Saving…" : "Save"}</button>
+                              <button onClick={() => { setEditingId(null); setGreenhouseError("") }} className="rounded-xl bg-black/5 px-4 py-2.5 text-xs font-bold text-ink">Cancel</button>
+                            </div>
+                          </div>
+                        ) : removingId === greenhouse.id ? (
+                          <div className="rounded-xl bg-red-50 p-3">
+                            <p className="text-xs font-bold text-red-600">Remove {greenhouse.name}?</p>
+                            <p className="mt-1 text-[11px] leading-4 text-red-600/80">It will be unlinked from your account and its settings and readings cleared. The hub can be added again with its claim code.</p>
+                            {greenhouseError && <p className="mt-2 text-xs font-medium text-red-600">{greenhouseError}</p>}
+                            <div className="mt-3 flex gap-2">
+                              <button onClick={() => confirmRemove(greenhouse.id)} disabled={busyId === greenhouse.id} className="flex-1 rounded-xl bg-red-600 px-4 py-2.5 text-xs font-bold text-white disabled:opacity-60">{busyId === greenhouse.id ? "Removing…" : "Remove"}</button>
+                              <button onClick={() => { setRemovingId(null); setGreenhouseError("") }} className="rounded-xl bg-white px-4 py-2.5 text-xs font-bold text-ink">Cancel</button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="flex gap-2">
+                            <button onClick={() => startEdit(greenhouse)} className="rounded-xl bg-black/5 px-3 py-2 text-xs font-bold text-ink">Edit</button>
+                            <button onClick={() => { setRemovingId(greenhouse.id); setEditingId(null); setGreenhouseError("") }} className="rounded-xl bg-red-50 px-3 py-2 text-xs font-bold text-red-600">Remove</button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
                   )
                 })
               )}
@@ -2147,18 +2360,33 @@ function ProfilePanel({
 
 
 
-function SensorCard({ label, value, unit, icon, tone, progress }: { label: string; value: string; unit: string; icon: IconName; tone: string; progress: number }) {
+function SensorCard({ label, value, unit, icon, tone, progress, target }: { label: string; value: string; unit: string; icon: IconName; tone: string; progress: number; target?: { min: number; max: number } }) {
   const colors = toneClasses[tone]
   const hasValue = value !== "—"
+  const num = Number(value)
+
+  let status: "live" | "in" | "near" | "out" = "live"
+  if (hasValue && target) {
+    const width = target.max - target.min || 1
+    const delta = num < target.min ? target.min - num : num > target.max ? num - target.max : 0
+    status = delta === 0 ? "in" : delta <= width * 0.25 ? "near" : "out"
+  }
+
+  const badgeText = !hasValue ? "NO DATA" : status === "in" ? "IN RANGE" : status === "near" ? "NEAR RANGE" : status === "out" ? "OUT OF RANGE" : "LIVE"
+  const badgeColor = !hasValue ? "text-muted" : status === "near" ? "text-amber-ink" : status === "out" ? "text-coral" : "text-leaf"
+  const dotColor = !hasValue ? "bg-border" : status === "near" ? "bg-amber" : status === "out" ? "bg-coral" : "bg-leaf"
+  const fillColor = !hasValue || !target ? colors.fill : status === "near" ? "bg-amber" : status === "out" ? "bg-coral" : "bg-leaf"
+
   return (
     <div className="rounded-2xl border border-border bg-white p-5 shadow-card transition hover:-translate-y-0.5 hover:shadow-lg">
       <div className="flex items-start justify-between">
         <div className={`grid size-10 place-items-center rounded-xl ${colors.soft} ${colors.ink}`}><Icon name={icon} size={19} /></div>
-        <span className={`flex items-center gap-1.5 text-[10px] font-bold ${hasValue ? "text-leaf" : "text-muted"}`}><span className={`size-1.5 rounded-full ${hasValue ? "bg-leaf" : "bg-border"}`} />{hasValue ? "LIVE" : "NO DATA"}</span>
+        <span className={`flex items-center gap-1.5 text-[10px] font-bold ${badgeColor}`}><span className={`size-1.5 rounded-full ${dotColor}`} />{badgeText}</span>
       </div>
       <p className="mt-5 text-xs font-medium text-muted">{label}</p>
       <p className="mt-1 text-3xl font-bold tracking-tight">{value}{hasValue && <span className="ml-1 text-sm font-semibold text-muted">{unit}</span>}</p>
-      <div className="mt-4 h-1.5 rounded-full bg-canvas"><div className={`h-full rounded-full ${colors.fill}`} style={{ width: `${progress}%` }} /></div>
+      {target && <p className="mt-1 text-[10px] font-medium text-muted">Target {target.min}–{target.max}{unit}</p>}
+      <div className="mt-4 h-1.5 rounded-full bg-canvas"><div className={`h-full rounded-full ${fillColor}`} style={{ width: `${progress}%` }} /></div>
     </div>
   )
 }
