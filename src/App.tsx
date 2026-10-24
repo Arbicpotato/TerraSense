@@ -7,7 +7,7 @@ import {
   updateProfile, onAuthStateChanged, signOut, type User,
 } from "firebase/auth"
 import { auth, db, firestore } from "./firebase"
-import { doc, setDoc, getDoc, serverTimestamp } from "firebase/firestore"
+   import { doc, setDoc, getDoc, getDocs, collection, serverTimestamp } from "firebase/firestore"
 import { ref, onValue, set, remove, update, query, limitToLast } from "firebase/database"
 import { BleClient, dataViewToText } from "@capacitor-community/bluetooth-le"
 
@@ -108,21 +108,49 @@ const bleErrors: Record<string, string> = {
   "error:bad_ssid": "Enter a valid Wi-Fi network name.",
 }
 
+async function findHub(id: string, onStep: (message: string) => void): Promise<string> {
+  const wanted = `TerraSense-${id.slice(6)}`
+
+  await BleClient.initialize({ androidNeverForLocation: true })
+
+  try {
+    if (Capacitor.getPlatform() === "android" && !(await BleClient.isEnabled())) {
+      await BleClient.enable()
+    }
+  } catch {
+    throw new Error("Bluetooth is off. Turn it on and try again.")
+  }
+
+  onStep("Looking for your hub…")
+  const seen = new Set<string>()
+  const result = { deviceId: "" }
+
+  await BleClient.requestLEScan({ services: [BLE_SERVICE] }, (r) => {
+    const name = r.localName ?? r.device.name ?? ""
+    if (name) seen.add(name)
+    if (name === wanted) result.deviceId = r.device.deviceId
+  })
+
+  for (let i = 0; i < 10 && !result.deviceId; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+  await BleClient.stopLEScan().catch(() => {})
+
+  if (result.deviceId) return result.deviceId
+
+  if (seen.size > 0) {
+    throw new Error(`Found a TerraSense hub named "${[...seen].join(", ")}", but not "${wanted}". Check the greenhouse ID.`)
+  }
+  throw new Error("No hub found. Check that it is powered on and nearby, that Bluetooth is on, and that the app has Nearby devices permission.")
+}
+
 async function provisionHubOverBle(
   ghId: string, code: string, ssid: string, pass: string, onStep: (message: string) => void
 ) {
   const id = ghId.trim().toUpperCase()
   if (!GH_ID_PATTERN.test(id)) throw new Error("Enter a valid ID in the format TS-GH-XXXX.")
 
-  await BleClient.initialize({ androidNeverForLocation: true })
-  onStep("Looking for your hub…")
-  let deviceId: string
-  try {
-    const device = await BleClient.requestDevice({ services: [BLE_SERVICE], name: `TerraSense-${id.slice(6)}` })
-    deviceId = device.deviceId
-  } catch {
-    throw new Error("No hub found. Check that it is powered on, nearby, and that Bluetooth is on.")
-  }
+  const deviceId = await findHub(id, onStep)
 
   onStep("Connecting…")
   await BleClient.connect(deviceId)
@@ -144,7 +172,40 @@ async function provisionHubOverBle(
     await BleClient.disconnect(deviceId).catch(() => {})
   }
 }
+// Page 1 of setup: find the hub and stay connected
+async function connectToHub(
+  ghId: string, onStep: (message: string) => void, onLost?: () => void
+): Promise<string> {
+  const id = ghId.trim().toUpperCase()
+  if (!GH_ID_PATTERN.test(id)) throw new Error("Enter a valid ID in the format TS-GH-XXXX.")
+  const deviceId = await findHub(id, onStep)
+  onStep("Connecting…")
+  await BleClient.connect(deviceId, () => onLost?.())
+  return deviceId
+}
 
+// Page 2 of setup: send Wi-Fi over the open connection and wait for the result
+async function sendWifiToHub(
+  deviceId: string, code: string, ssid: string, pass: string, onStep: (message: string) => void
+) {
+  const bytes = new TextEncoder().encode(JSON.stringify({ ssid, pass, code: code.trim().toUpperCase() }) + "\n")
+  for (let i = 0; i < bytes.length; i += 18) {
+    const chunk = bytes.slice(i, i + 18)
+    await BleClient.write(deviceId, BLE_SERVICE, BLE_PROV, new DataView(chunk.buffer))
+  }
+  onStep("Hub is joining your Wi-Fi…")
+  for (let i = 0; i < 30; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+    const status = dataViewToText(await BleClient.read(deviceId, BLE_SERVICE, BLE_STATUS))
+    if (status === "wifi_ok") return
+    if (status.startsWith("error:")) throw new Error(bleErrors[status] ?? "Setup failed. Please try again.")
+  }
+  throw new Error("The hub didn't report back. Check the Wi-Fi password and try again.")
+}
+
+async function disconnectHub(deviceId: string) {
+  await BleClient.disconnect(deviceId).catch(() => {})
+}
 function authMessage(e: any) {
   const code = String(e?.code ?? "")
   if (/invalid-credential|wrong-password|user-not-found/.test(code)) return "Incorrect email or password."
@@ -879,6 +940,7 @@ function App() {
             if (!user) throw new Error("You must be signed in to remove a greenhouse.")
             await unlinkGreenhouse(user.uid, id)
           }}
+          onSetupHub={() => { setProfileOpen(false); setAuthScreen("setup") }}
           onAdd={async (input) => {
             if (!user) throw new Error("You must be signed in to add a greenhouse.")
             const id = await claimGreenhouse(user.uid, input)
@@ -1337,21 +1399,60 @@ function WifiSetupScreen({
   const [greenhouseId, setGreenhouseId] = useState("")
   const [claimCode, setClaimCode] = useState("")
   const [greenhouseName, setGreenhouseName] = useState("")
+  const [deviceName, setDeviceName] = useState("TerraSense Hub")
   const [ssid, setSsid] = useState("")
   const [password, setPassword] = useState("")
-  const [deviceName, setDeviceName] = useState("TerraSense Hub")
-  const [sharing, setSharing] = useState(false)
+  const [hubDeviceId, setHubDeviceId] = useState("")   // set while the phone is connected to the hub
+  const [busy, setBusy] = useState(false)
   const [step, setStep] = useState("")
   const [error, setError] = useState("")
 
-  const connectDevice = async (event: React.FormEvent) => {
+  const connected = hubDeviceId !== ""
+  const hubName = `TerraSense-${greenhouseId.trim().toUpperCase().slice(6)}`
+
+  // Offer the Wi-Fi details already saved in the app, so they don't need retyping
+  useEffect(() => {
+    const user = auth.currentUser
+    if (!user) return
+    getDocs(collection(firestore, "users", user.uid, "devices"))
+      .then((snap) => {
+        const saved = snap.docs.map((d) => d.data()).find((d) => d.ssid)
+        if (saved) {
+          setSsid((current) => current || saved.ssid)
+          setPassword((current) => current || saved.wifiPassword || "")
+        }
+      })
+      .catch(() => {})
+  }, [])
+
+  // Page 1: find the hub over Bluetooth and connect
+  const searchHub = async (event: React.FormEvent) => {
     event.preventDefault()
-    if (sharing) return
+    if (busy) return
 
     if (!greenhouseId.trim() || !claimCode.trim()) {
       setError("Enter the greenhouse ID and claim code from your TerraSense hub.")
       return
     }
+
+    try {
+      setBusy(true)
+      setError("")
+      const deviceId = await connectToHub(greenhouseId, setStep, () => setHubDeviceId(""))
+      setHubDeviceId(deviceId)
+    } catch (e: any) {
+      console.error("Bluetooth connect error:", e)
+      setError(e?.message || "Couldn't connect to the hub. Please try again.")
+    } finally {
+      setBusy(false)
+      setStep("")
+    }
+  }
+
+  // Page 2: send the Wi-Fi over Bluetooth, then link the hub to this account
+  const sendWifi = async (event: React.FormEvent) => {
+    event.preventDefault()
+    if (busy) return
 
     if (!ssid.trim() || !password) {
       setError("Please enter your Wi-Fi network name and password.")
@@ -1359,29 +1460,35 @@ function WifiSetupScreen({
     }
 
     const user = auth.currentUser
-
     if (!user) {
       setError("You must be signed in to connect a device.")
       return
     }
 
     try {
-      setSharing(true)
+      setBusy(true)
       setError("")
 
-      // 0) Hand the Wi-Fi details to the hub over Bluetooth (it has no network yet)
-      await provisionHubOverBle(greenhouseId, claimCode, ssid.trim(), password, setStep)
+      await sendWifiToHub(hubDeviceId, claimCode, ssid.trim(), password, setStep)
       setStep("Linking to your account…")
 
-      // 1) Claim the ESP32 hub so Firebase links it to THIS user
-      const id = await claimGreenhouse(user.uid, {
-        id: greenhouseId,
-        code: claimCode,
-        name: greenhouseName,
-        location: "",
-      })
+      // The hub needs a few seconds after joining Wi-Fi to register itself, so retry
+      let id = ""
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          id = await claimGreenhouse(user.uid, {
+            id: greenhouseId,
+            code: claimCode,
+            name: greenhouseName,
+            location: "",
+          })
+          break
+        } catch (err) {
+          if (attempt === 4) throw err
+          await new Promise((resolve) => setTimeout(resolve, 3000))
+        }
+      }
 
-      // 2) Save the Wi-Fi details for that hub
       const name = deviceName.trim() || "TerraSense Hub"
       await setDoc(
         doc(firestore, "users", user.uid, "devices", id),
@@ -1390,20 +1497,35 @@ function WifiSetupScreen({
           greenhouseId: id,
           ssid: ssid.trim(),
           wifiPassword: password,
+          claimCode: claimCode.trim().toUpperCase(),
           status: "configured",
           createdAt: serverTimestamp(),
         },
         { merge: true }
       )
 
+      await disconnectHub(hubDeviceId)
+      setHubDeviceId("")
       onComplete({ ssid: ssid.trim(), password, deviceName: name }, id)
     } catch (e: any) {
       console.error("Device setup error:", e)
       setError(e?.message || "Unable to connect the device. Please try again.")
     } finally {
-      setSharing(false)
+      setBusy(false)
       setStep("")
     }
+  }
+
+  const goBack = async () => {
+    if (busy) return
+    await disconnectHub(hubDeviceId)
+    setHubDeviceId("")
+    setError("")
+  }
+
+  const skip = async () => {
+    if (hubDeviceId) await disconnectHub(hubDeviceId)
+    onSkip()
   }
 
   return (
@@ -1423,67 +1545,118 @@ function WifiSetupScreen({
           </div>
 
           <span className="rounded-full bg-mint px-2.5 py-1 text-[10px] font-bold text-forest">
-            STEP 2 OF 2
+            {connected ? "SETUP 2 OF 2" : "SETUP 1 OF 2"}
           </span>
         </div>
 
-        <div className="mt-10">
-          <div className="grid size-14 place-items-center rounded-2xl bg-blue-soft text-blue-ink">
-            <Icon name="wifi" size={25} />
-          </div>
+        {!connected ? (
+          <>
+            <div className="mt-10">
+              <div className="grid size-14 place-items-center rounded-2xl bg-blue-soft text-blue-ink">
+                <Icon name="bolt" size={25} />
+              </div>
 
-          <p role="heading" aria-level={1} className="mt-6 text-3xl font-extrabold tracking-tight">
-            Connect your device.
-          </p>
+              <p role="heading" aria-level={1} className="mt-6 text-3xl font-extrabold tracking-tight">
+                Connect with Bluetooth.
+              </p>
 
-          <p className="mt-3 text-sm leading-6 text-muted">
-            Enter the ID and claim code on your TerraSense hub to link it to your account, then the Wi-Fi network it should use.
-          </p>
-        </div>
+              <p className="mt-3 text-sm leading-6 text-muted">
+                Enter the ID and claim code of your TerraSense hub. Your phone will find it and connect over Bluetooth.
+              </p>
+            </div>
 
-        <form onSubmit={connectDevice} className="mt-8 space-y-5">
+            <form onSubmit={searchHub} className="mt-8 space-y-5">
+              <AuthField id="setup-gh-id" label="Greenhouse ID" type="text" value={greenhouseId} onChange={setGreenhouseId} placeholder="TS-GH-XXXX" />
+              <AuthField id="setup-claim-code" label="Claim code" type="text" value={claimCode} onChange={setClaimCode} placeholder="Code shown on your hub" />
+              <AuthField id="setup-gh-name" label="Greenhouse name" type="text" value={greenhouseName} onChange={setGreenhouseName} placeholder="e.g. North greenhouse" />
+              <AuthField id="setup-device" label="Device name" type="text" value={deviceName} onChange={setDeviceName} placeholder="TerraSense Hub" />
 
-          <AuthField id="setup-gh-id" label="Greenhouse ID" type="text" value={greenhouseId} onChange={setGreenhouseId} placeholder="TS-GH-XXXX" />
-          <AuthField id="setup-claim-code" label="Claim code" type="text" value={claimCode} onChange={setClaimCode} placeholder="Code shown on your hub" />
-          <AuthField id="setup-gh-name" label="Greenhouse name" type="text" value={greenhouseName} onChange={setGreenhouseName} placeholder="e.g. North greenhouse" />
-          <AuthField id="setup-device" label="Device name" type="text" value={deviceName} onChange={setDeviceName} placeholder="TerraSense Hub" />
-          <AuthField id="setup-ssid" label="Wi-Fi network name" type="text" value={ssid} onChange={setSsid} placeholder="Enter network SSID" />
-          <AuthField id="setup-wifi-password" label="Wi-Fi password" type="password" value={password} onChange={setPassword} placeholder="Enter network password" />
+              {error && (
+                <p className="rounded-2xl bg-red-50 px-4 py-3 text-sm font-medium text-red-600">
+                  {error}
+                </p>
+              )}
 
-          {error && (
-            <p className="rounded-2xl bg-red-50 px-4 py-3 text-sm font-medium text-red-600">
-              {error}
-            </p>
-          )}
+              <div className="flex gap-3 rounded-2xl bg-mint/50 p-4 text-forest">
+                <Icon name="bolt" size={18} />
 
-          <div className="flex gap-3 rounded-2xl bg-mint/50 p-4 text-forest">
-            <Icon name="bolt" size={18} />
+                <p className="text-[10px] leading-4">
+                  Keep your TerraSense hub powered on and within a few meters of your phone, with Bluetooth turned on. Allow the Nearby devices permission when asked.
+                </p>
+              </div>
 
-            <p className="text-[10px] leading-4">
-              Keep your TerraSense hub powered on and within a few meters of your phone, with Bluetooth turned on.
-            </p>
-          </div>
+              <button
+                disabled={busy}
+                type="submit"
+                className="flex w-full items-center justify-center gap-2 rounded-2xl bg-forest py-4 text-sm font-bold text-white shadow-lg transition disabled:opacity-70"
+              >
+                {busy ? (
+                  <>
+                    <span className="size-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                    {step || "Searching…"}
+                  </>
+                ) : (
+                  "Search for hub"
+                )}
+              </button>
 
-          <button
-            disabled={sharing}
-            type="submit"
-            className="flex w-full items-center justify-center gap-2 rounded-2xl bg-forest py-4 text-sm font-bold text-white shadow-lg transition disabled:opacity-70"
-          >
-            {sharing ? (
-              <>
-                <span className="size-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
-                {step || "Linking device…"}
-              </>
-            ) : (
-              "Connect TerraSense device"
-            )}
-          </button>
+              <button type="button" onClick={skip} className="w-full py-2 text-xs font-bold text-muted">
+                Skip for now
+              </button>
+            </form>
+          </>
+        ) : (
+          <>
+            <div className="mt-10">
+              <div className="grid size-14 place-items-center rounded-2xl bg-blue-soft text-blue-ink">
+                <Icon name="wifi" size={25} />
+              </div>
 
-          <button type="button" onClick={onSkip} className="w-full py-2 text-xs font-bold text-muted">
-            Skip for now
-          </button>
+              <p role="heading" aria-level={1} className="mt-6 text-3xl font-extrabold tracking-tight">
+                Send your Wi-Fi.
+              </p>
 
-        </form>
+              <p className="mt-3 text-sm leading-6 text-muted">
+                Your hub will join this network. It must be a 2.4 GHz network.
+              </p>
+
+              <p className="mt-4 inline-flex items-center gap-2 rounded-full bg-green-soft px-3 py-1.5 text-[11px] font-bold text-green-ink">
+                <span className="size-2 rounded-full bg-green" />
+                Connected to {hubName}
+              </p>
+            </div>
+
+            <form onSubmit={sendWifi} className="mt-8 space-y-5">
+              <AuthField id="setup-ssid" label="Wi-Fi network name" type="text" value={ssid} onChange={setSsid} placeholder="Enter network SSID" />
+              <AuthField id="setup-wifi-password" label="Wi-Fi password" type="password" value={password} onChange={setPassword} placeholder="Enter network password" />
+
+              {error && (
+                <p className="rounded-2xl bg-red-50 px-4 py-3 text-sm font-medium text-red-600">
+                  {error}
+                </p>
+              )}
+
+              <button
+                disabled={busy}
+                type="submit"
+                className="flex w-full items-center justify-center gap-2 rounded-2xl bg-forest py-4 text-sm font-bold text-white shadow-lg transition disabled:opacity-70"
+              >
+                {busy ? (
+                  <>
+                    <span className="size-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                    {step || "Sending…"}
+                  </>
+                ) : (
+                  "Send Wi-Fi to hub"
+                )}
+              </button>
+
+              <button type="button" onClick={goBack} className="w-full py-2 text-xs font-bold text-muted">
+                Back
+              </button>
+            </form>
+          </>
+        )}
       </main>
     </div>
   )
@@ -1770,6 +1943,7 @@ function ProfilePanel({
   currentGreenhouse,
   onSwitch,
   onAdd,
+  onSetupHub,
   onEdit,
   onRemove,
   wifiSettings,
@@ -1783,6 +1957,7 @@ function ProfilePanel({
   currentGreenhouse: number
   onSwitch: (index: number) => void
   onAdd: (input: { id: string; code: string; name: string; location: string }) => Promise<void>
+  onSetupHub: () => void
   onEdit: (id: string, data: { name: string; location: string }) => Promise<void>
   onRemove: (id: string) => Promise<void>
   wifiSettings: WifiSettings
@@ -2020,10 +2195,7 @@ function ProfilePanel({
               </div>
 
               <button
-                onClick={() => {
-                  setAddingGreenhouse((value) => !value)
-                  setGreenhouseError("")
-                }}
+                onClick={onSetupHub}
                 className="grid size-9 place-items-center rounded-xl bg-forest text-white transition hover:opacity-90"
                 aria-label="Add greenhouse"
               >
