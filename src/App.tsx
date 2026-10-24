@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react"
-import { Capacitor } from "@capacitor/core"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { Capacitor, registerPlugin } from "@capacitor/core"
 import { FirebaseAuthentication } from "@capacitor-firebase/authentication"
 import {
   GoogleAuthProvider, signInWithCredential, signInWithPopup,
@@ -7,9 +7,10 @@ import {
   updateProfile, onAuthStateChanged, signOut, type User,
 } from "firebase/auth"
 import { auth, db, firestore } from "./firebase"
-   import { doc, setDoc, getDoc, getDocs, collection, serverTimestamp } from "firebase/firestore"
-import { ref, onValue, set, remove, update, query, limitToLast } from "firebase/database"
+  import { doc, setDoc, getDoc, getDocs, deleteDoc, deleteField, collection, serverTimestamp } from "firebase/firestore"
+import { ref, onValue, set, remove, update, query, limitToLast,get } from "firebase/database"
 import { BleClient, dataViewToText } from "@capacitor-community/bluetooth-le"
+import { LocalNotifications } from "@capacitor/local-notifications"
 
 
 
@@ -51,17 +52,47 @@ async function claimGreenhouse(
 
   if (!GH_ID_PATTERN.test(id)) throw new Error("Enter a valid ID in the format TS-GH-XXXX.")
   if (!code) throw new Error("Enter the claim code printed on your TerraSense hub.")
-
+    
   try {
     await set(ref(db, `claims/${id}/${uid}`), code)
-    await set(ref(db, `greenhouses/${id}/ownerUid`), uid)
+
+    let alreadyMine = false
+    try {
+      alreadyMine = (await get(ref(db, `greenhouses/${id}/ownerUid`))).val() === uid
+    } catch {}
+    if (!alreadyMine) await set(ref(db, `greenhouses/${id}/ownerUid`), uid)
+
     await set(ref(db, `userGreenhouses/${uid}/${id}`), true)
-    await set(ref(db, `greenhouses/${id}/meta`), {
-      name: input.name.trim() || `Greenhouse ${id.slice(-4)}`,
-      location: input.location.trim() || "Location not set",
-      crop: "No crop selected",
-      stage: "Setup",
-    })
+
+    // The same owner setting the hub up again (new Wi-Fi, reinstalled app) must not break a running plant cycle,
+    // so their greenhouse record is kept. A new owner starts clean: the plan only ends when the owner is removed.
+    let hasMeta = false
+    if (alreadyMine) {
+      try { hasMeta = (await get(ref(db, `greenhouses/${id}/meta/name`))).exists() } catch {}
+    }
+    if (!hasMeta) {
+      await set(ref(db, `greenhouses/${id}/meta`), {
+        name: input.name.trim() || `Greenhouse ${id.slice(-4)}`,
+        location: input.location.trim() || "Location not set",
+        crop: "No crop selected",
+        stage: "Setup",
+      })
+    } else if (input.name.trim()) {
+      await update(ref(db, `greenhouses/${id}/meta`), { name: input.name.trim() })
+    }
+
+    // Removing a hub clears its record in the database, but this user's plant cycle is kept on their
+    // account (see the plan backup effect in App). Put it back, so the cycle carries on where it was.
+    try {
+      const backup = await getDoc(doc(firestore, "users", uid, "devices", id))
+      const plan: any = backup.exists() ? backup.data().plan : undefined
+      if (plan && plan.stages) {
+        const planAlready = (await get(ref(db, `greenhouses/${id}/meta/plan`))).exists()
+        if (!planAlready) await set(ref(db, `greenhouses/${id}/meta/plan`), plan)
+      }
+    } catch (e) {
+      console.error("Plant cycle restore failed:", e)
+    }
   } catch (e) {
     if (isPermissionError(e)) {
       throw new Error(
@@ -84,11 +115,11 @@ async function unlinkGreenhouse(uid: string, id: string) {
   const base = `greenhouses/${id}`
   try {
     await remove(ref(db, `userGreenhouses/${uid}/${id}`))
-    await remove(ref(db, `${base}/controls`))
-    await remove(ref(db, `${base}/live`))
-    await remove(ref(db, `${base}/history`))
-    await remove(ref(db, `${base}/wifi`))
-    await remove(ref(db, `${base}/meta`))
+    // Clean-up is best effort: a failure here must never block releasing ownership
+    for (const child of ["controls", "live", "history", "meta"]) {
+      await remove(ref(db, `${base}/${child}`)).catch(() => {})
+    }
+    // Last: the other rules check ownerUid, so it has to go after everything else
     await remove(ref(db, `${base}/ownerUid`))
   } catch (e) {
     if (isPermissionError(e)) throw new Error("You don't have permission to remove this greenhouse.")
@@ -206,6 +237,160 @@ async function sendWifiToHub(
 async function disconnectHub(deviceId: string) {
   await BleClient.disconnect(deviceId).catch(() => {})
 }
+// ---- Saved Wi-Fi networks (per account, so each hub can be given a different one) ----
+type SavedNetwork = { id: string; ssid: string; password: string; ts?: number }
+
+// Firestore document ids can't contain "/", so the id is the network name in hex
+function networkId(ssid: string) {
+  return Array.from(new TextEncoder().encode(ssid)).map((b) => b.toString(16).padStart(2, "0")).join("")
+}
+
+async function loadNetworks(uid: string): Promise<SavedNetwork[]> {
+  const read = async () => {
+    const snap = await getDocs(collection(firestore, "users", uid, "wifiNetworks"))
+    return snap.docs
+      .map((d) => ({
+        id: d.id,
+        ssid: (d.data().ssid as string) ?? "",
+        password: (d.data().password as string) ?? "",
+        ts: (d.data().updatedAt as any)?.toMillis?.() ?? 0,
+      }))
+      .filter((n) => n.ssid)
+      .sort((a, b) => a.ssid.localeCompare(b.ssid))
+  }
+
+  const list = await read()
+
+  // One-time import of the Wi-Fi that was saved with each hub before this list existed. It runs once per
+  // account and is then marked done, so a network the user deletes never comes back.
+  try {
+    const doneRef = doc(firestore, "users", uid, "wifiNetworks", "_imported")
+    if (!(await getDoc(doneRef)).exists()) {
+      let result = list
+      if (list.length === 0) {
+        const devices = await getDocs(collection(firestore, "users", uid, "devices"))
+        const old = devices.docs.map((d) => d.data()).filter((d) => d.ssid)
+        if (old.length > 0) {
+          await Promise.all(old.map((d) => saveNetwork(uid, d.ssid as string, (d.wifiPassword as string) ?? "")))
+          result = await read()
+        }
+      }
+      await setDoc(doneRef, { done: true })
+      return result
+    }
+  } catch {}
+  return list
+}
+
+async function saveNetwork(uid: string, ssid: string, password: string) {
+  await setDoc(
+    doc(firestore, "users", uid, "wifiNetworks", networkId(ssid)),
+    { ssid, password, updatedAt: serverTimestamp() },
+    { merge: true }
+  )
+}
+
+async function deleteNetwork(uid: string, id: string) {
+  await deleteDoc(doc(firestore, "users", uid, "wifiNetworks", id))
+}
+// ---- Home-screen widget (Android): the app hands it the latest numbers, current action and plant cycle ----
+const WidgetBridge = registerPlugin<{ update(options: { json: string }): Promise<void> }>("WidgetBridge")
+
+// ---- Notifications: hub-offline alert + always-on plant cycle card ----
+const CYCLE_CHANNEL = "plant-cycle"
+const ALERT_CHANNEL = "hub-alerts"
+const NOTIF_KEY = "terrasense.notifPrefs"
+
+type NotifPrefs = { offline: boolean; cycle: boolean }
+
+function loadNotifPrefs(): NotifPrefs {
+  try {
+    const raw = localStorage.getItem(NOTIF_KEY)
+    if (raw) {
+      const p = JSON.parse(raw)
+      return { offline: p.offline !== false, cycle: p.cycle !== false }
+    }
+  } catch {}
+  return { offline: true, cycle: true }
+}
+
+// Notification ids must be integers; derive a stable one per greenhouse so a repeat replaces the old card
+function notifId(text: string) {
+  let h = 7
+  for (const c of text) h = (h * 31 + c.charCodeAt(0)) | 0
+  return (Math.abs(h) % 2000000000) + 1
+}
+
+async function ensureNotifications(): Promise<boolean> {
+  if (!Capacitor.isNativePlatform()) return false
+  try {
+    let perm = await LocalNotifications.checkPermissions()
+    if (perm.display === "prompt" || perm.display === "prompt-with-rationale") {
+      perm = await LocalNotifications.requestPermissions()
+    }
+    if (perm.display !== "granted") return false
+    if (Capacitor.getPlatform() === "android") {
+      await LocalNotifications.createChannel({
+        id: CYCLE_CHANNEL, name: "Plant cycle", description: "Always-on status of the current growth stage",
+        importance: 2, vibration: false,
+      })
+      await LocalNotifications.createChannel({
+        id: ALERT_CHANNEL, name: "Hub alerts", description: "Alerts when a hub goes offline",
+        importance: 4, vibration: true,
+      })
+    }
+    return true
+  } catch (e) {
+    console.error("Notification setup failed:", e)
+    return false
+  }
+}
+
+async function notifyHubOffline(gh: { id: string; name: string }) {
+  if (!(await ensureNotifications())) return
+  await LocalNotifications.schedule({
+    notifications: [{
+      id: notifId(`offline:${gh.id}`),
+      title: `${gh.name} is offline`,
+      body: "Your hub stopped reporting. Check its power and Wi-Fi. If the Wi-Fi changed, reconnect it over Bluetooth from Settings.",
+      channelId: ALERT_CHANNEL,
+    }],
+  })
+}
+
+async function clearHubOffline(id: string) {
+  if (!Capacitor.isNativePlatform()) return
+  await LocalNotifications.cancel({ notifications: [{ id: notifId(`offline:${id}`) }] }).catch(() => {})
+}
+
+type CycleNote = { key: string; title: string; body: string; large: string }
+
+function cycleNotification(gh: Greenhouse, now: number): CycleNote | null {
+  const plan = gh.plan
+  const cur = currentStage(plan, now)
+  if (!plan || !cur) return null
+  const total = plan.stages.reduce((sum, st) => sum + st.days, 0)
+  if (cur.finished) {
+    const body = `${gh.name} · cycle complete after ${total} days`
+    return { key: `${plan.name}|done|${total}`, title: `${plan.name} · cycle complete`, body, large: body }
+  }
+  let end = 0
+  for (const st of plan.stages) {
+    end += st.days
+    if (st === cur.stage) break
+  }
+  const left = Math.max(1, end - cur.day + 1)
+  const next = plan.stages[plan.stages.indexOf(cur.stage) + 1]
+  const title = `${plan.name} · ${cur.stage.name} stage`
+  const body = `${gh.name} · Day ${cur.day} of ${total} · ${left} ${left === 1 ? "day" : "days"} left in this stage`
+  const large = [
+    body,
+    `Targets: ${cur.stage.tempMin}–${cur.stage.tempMax}°C, soil ${cur.stage.moistureMin}–${cur.stage.moistureMax}%`,
+    next ? `Next: ${next.name}` : "Final stage",
+  ].join("\n")
+  return { key: `${title}|${body}`, title, body, large }
+}
+
 function authMessage(e: any) {
   const code = String(e?.code ?? "")
   if (/invalid-credential|wrong-password|user-not-found/.test(code)) return "Incorrect email or password."
@@ -272,6 +457,7 @@ const sensorDefs = [
   { key: "temperature", label: "Temperature", unit: "°C", icon: "thermometer" as IconName, tone: "amber", max: 50 },
   { key: "humidity", label: "Humidity", unit: "%", icon: "droplet" as IconName, tone: "blue", max: 100 },
   { key: "soilMoisture", label: "Soil moisture", unit: "%", icon: "leaf" as IconName, tone: "green", max: 100 },
+  { key: "lightLux", label: "Light", unit: "lx", icon: "sun" as IconName, tone: "purple", max: 100000 },
 ] as const
 
 const controlDefs: { key: string; name: string; icon: IconName }[] = [
@@ -290,12 +476,13 @@ type LiveData = {
   temperature?: number
   humidity?: number
   soilMoisture?: number
+  lightLux?: number
   waterTank?: number
   fertilizer?: number
   updatedAt?: number
 }
 
-type HistoryRow = { temperature?: number; humidity?: number; soilMoisture?: number }
+type HistoryRow = { temperature?: number; humidity?: number; soilMoisture?: number; lightLux?: number }
 
 type StageDef = {
   key: string
@@ -444,6 +631,7 @@ function App() {
   const [currentGreenhouse, setCurrentGreenhouse] = useState(0)
   const [pendingSelect, setPendingSelect] = useState<string | null>(null)
   const [profileOpen, setProfileOpen] = useState(false)
+  const [notifPrefs, setNotifPrefs] = useState<NotifPrefs>(loadNotifPrefs)
 
   const [user, setUser] = useState<User | null>(null)
   const [authReady, setAuthReady] = useState(false)
@@ -595,7 +783,7 @@ function App() {
         const v = child.val() ?? {}
         const t = num(v.temperature)
         if (t !== undefined) rows.push(t)
-        full.push({ temperature: t, humidity: num(v.humidity), soilMoisture: num(v.soilMoisture) })
+        full.push({ temperature: t, humidity: num(v.humidity), soilMoisture: num(v.soilMoisture), lightLux: num(v.lightLux) })
       })
       setHistory(rows)
       setHistoryRows(full)
@@ -603,20 +791,52 @@ function App() {
     return () => { offLive(); offControls(); offHistory() }
   }, [currentId])
 
-  // 3) Saved Wi-Fi settings for the selected greenhouse
+  // 3) Wi-Fi shown in Settings: the selected greenhouse's own network, otherwise the network saved most
+  //    recently on the account. Nothing is cleared when the last greenhouse is removed.
   useEffect(() => {
-    setWifiSettings({ ssid: "", password: "", deviceName: "TerraSense Hub" })
-    if (!user || !currentId) return
+    setWifiSettings({ ssid: "", password: "", deviceName: "TerraSense Hub" })   // different account: start clean
+  }, [user?.uid])
+
+  useEffect(() => {
+    if (!user) return
     let cancelled = false
-    getDoc(doc(firestore, "users", user.uid, "devices", currentId))
-      .then((snap) => {
-        if (cancelled || !snap.exists()) return
-        const d = snap.data()
-        setWifiSettings({ ssid: d.ssid ?? "", password: d.wifiPassword ?? "", deviceName: d.name ?? "TerraSense Hub" })
-      })
-      .catch((e) => console.error("Wi-Fi settings load error:", e))
+    ;(async () => {
+      try {
+        if (currentId) {
+          const snap = await getDoc(doc(firestore, "users", user.uid, "devices", currentId))
+          const d: any = snap.exists() ? snap.data() : null
+          if (d?.ssid) {
+            if (!cancelled) setWifiSettings({ ssid: d.ssid, password: d.wifiPassword ?? "", deviceName: d.name ?? "TerraSense Hub" })
+            return
+          }
+        }
+        const list = await loadNetworks(user.uid)
+        if (cancelled || list.length === 0) return
+        const latest = [...list].sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]
+        setWifiSettings((current) => ({ ssid: latest.ssid, password: latest.password, deviceName: current.deviceName || "TerraSense Hub" }))
+      } catch (e) {
+        console.error("Wi-Fi settings load error:", e)
+      }
+    })()
     return () => { cancelled = true }
   }, [user?.uid, currentId])
+
+  // 3b) Back up each greenhouse's plant cycle on the user's account. Removing a hub wipes its record in the
+  //     database, so this copy is what lets the same cycle continue when the hub is added again.
+  const syncedPlans = useRef<Record<string, string>>({})
+  useEffect(() => { syncedPlans.current = {} }, [user?.uid])
+  useEffect(() => {
+    if (!user) return
+    for (const id of ghIds) {
+      const plan = ghMeta[id]?.plan
+      if (!plan) continue                                   // only copy while a cycle exists
+      const json = JSON.stringify(plan)
+      if (syncedPlans.current[id] === json) continue
+      syncedPlans.current[id] = json
+      setDoc(doc(firestore, "users", user.uid, "devices", id), { greenhouseId: id, plan }, { merge: true })
+        .catch((e) => { delete syncedPlans.current[id]; console.error("Plant cycle backup failed:", e) })
+    }
+  }, [user?.uid, ghIds, ghMeta])
 
   // Select a newly claimed greenhouse once it shows up; keep the index in range
   useEffect(() => {
@@ -639,6 +859,156 @@ function App() {
     }, (e) => console.error("User plants error:", e))
     return () => { offLib(); offMine() }
   }, [user?.uid])
+
+  const updateNotifPrefs = (next: NotifPrefs) => {
+    setNotifPrefs(next)
+    try { localStorage.setItem(NOTIF_KEY, JSON.stringify(next)) } catch {}
+    if (next.offline || next.cycle) ensureNotifications()   // ask now, not in the middle of an outage
+  }
+
+  // Alert when a hub drops off; remove the alert when it comes back
+  const wasOnline = useRef<Record<string, boolean>>({})
+  useEffect(() => {
+    greenhouses.forEach((g) => {
+      const on = isOnline(g.lastSeen, now)
+      const prev = wasOnline.current[g.id]
+      wasOnline.current[g.id] = on
+      if (prev === undefined) return
+      if (prev && !on && notifPrefs.offline) notifyHubOffline(g).catch((e) => console.error(e))
+      if (!prev && on) clearHubOffline(g.id)
+    })
+  }, [greenhouses, now, notifPrefs.offline])
+
+  // Always-on plant cycle card: one per greenhouse that has a plan, refreshed when the day or stage changes
+  const postedCycle = useRef<Record<string, string>>({})
+  const [cycleTick, setCycleTick] = useState(0)
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform()) return
+    ;(async () => {
+      // If the system swiped a card away, forget that it was posted so it comes straight back
+      try {
+        const { notifications } = await LocalNotifications.getDeliveredNotifications()
+        const shown = new Set(notifications.map((n) => n.id))
+        Object.keys(postedCycle.current).forEach((id) => {
+          if (postedCycle.current[id] && !shown.has(notifId(`cycle:${id}`))) delete postedCycle.current[id]
+        })
+      } catch {}
+
+      const toPost: { id: string; note: CycleNote }[] = []
+      const toCancel: string[] = []
+      const known = new Set(greenhouses.map((g) => g.id))
+
+      greenhouses.forEach((g) => {
+        const note = notifPrefs.cycle ? cycleNotification(g, now) : null
+        const prev = postedCycle.current[g.id]
+        if (!note) {
+          if (prev !== "") { toCancel.push(g.id); postedCycle.current[g.id] = "" }
+        } else if (prev !== note.key) {
+          toPost.push({ id: g.id, note })
+        }
+      })
+      Object.keys(postedCycle.current).forEach((id) => {
+        if (!known.has(id)) { toCancel.push(id); delete postedCycle.current[id] }
+      })
+
+      if (toCancel.length) {
+        await LocalNotifications.cancel({ notifications: toCancel.map((id) => ({ id: notifId(`cycle:${id}`) })) }).catch(() => {})
+      }
+      if (toPost.length && (await ensureNotifications())) {
+        await LocalNotifications.schedule({
+          notifications: toPost.map(({ id, note }) => ({
+            id: notifId(`cycle:${id}`),
+            title: note.title,
+            body: note.body,
+            largeBody: note.large,
+            channelId: CYCLE_CHANNEL,
+            ongoing: true,
+            autoCancel: false,
+          })),
+        })
+        toPost.forEach(({ id, note }) => { postedCycle.current[id] = note.key })
+      }
+    })().catch((e) => console.error("Cycle notification failed:", e))
+  }, [greenhouses, now, notifPrefs.cycle, cycleTick])
+
+  // Android 14+ lets the user swipe the card away even though it is "ongoing". Look every few seconds and
+  // post it again straight away.
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform() || !notifPrefs.cycle) return
+    const timer = window.setInterval(async () => {
+      try {
+        const { notifications } = await LocalNotifications.getDeliveredNotifications()
+        const shown = new Set(notifications.map((n) => n.id))
+        const missing = Object.keys(postedCycle.current).some(
+          (id) => postedCycle.current[id] && !shown.has(notifId(`cycle:${id}`))
+        )
+        if (missing) setCycleTick((t) => t + 1)
+      } catch {}
+    }, 5000)
+    return () => window.clearInterval(timer)
+  }, [notifPrefs.cycle])
+
+  // Home-screen widget: send the selected greenhouse's numbers, current action and plant cycle
+  useEffect(() => {
+    if (Capacitor.getPlatform() !== "android") return
+
+    let payload: Record<string, unknown> = { hasHub: false }
+    if (user && greenhouse) {
+      const relays = (live as any)?.relays ?? {}
+      const actions: string[] = []
+      if (!online) {
+        actions.push("Hub offline")
+      } else if (stopped) {
+        actions.push("Emergency stop")
+      } else {
+        if (relays.pump) actions.push("Irrigating")
+        if (relays.cooler) actions.push("Fan on")
+        if (relays.fertilizer) actions.push("Fertilizing")
+        if (actions.length === 0) actions.push(manualMode ? "Idle (manual mode)" : "Idle (automatic)")
+      }
+
+      const total = greenhouse.plan ? greenhouse.plan.stages.reduce((sum, st) => sum + st.days, 0) : 0
+      const day = cycle ? Math.min(cycle.day, total || cycle.day) : 0
+      const num = (v: unknown) => (typeof v === "number" ? v : null)
+
+      payload = {
+        hasHub: true,
+        name: greenhouse.name,
+        online,
+        temp: num(live?.temperature),
+        hum: num(live?.humidity),
+        soil: num(live?.soilMoisture),
+        lux: num(live?.lightLux),
+        action: actions.join(" · "),
+        cycle: greenhouse.plan && cycle
+          ? {
+              crop: greenhouse.plan.name,
+              day,
+              total,
+              stage: cycle.finished ? "Complete" : cycle.stage.name,
+              pct: total > 0 ? Math.round((day / total) * 100) : 0,
+            }
+          : null,
+      }
+    }
+
+    // Wait a moment so a burst of changes becomes one update
+    const timer = window.setTimeout(() => {
+      WidgetBridge.update({ json: JSON.stringify(payload) }).catch(() => {})
+    }, 1500)
+    return () => window.clearTimeout(timer)
+  }, [user?.uid, greenhouse?.id, greenhouse?.name, greenhouse?.plan, online, stopped, manualMode, live, cycle?.day, cycle?.finished])
+
+  // If the system swiped the card away, put it back when the app is opened again
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.hidden) return
+      postedCycle.current = {}
+      setNow(Date.now())
+    }
+    document.addEventListener("visibilitychange", onVisible)
+    return () => document.removeEventListener("visibilitychange", onVisible)
+  }, [])
 
   const setControlFlag = (key: string, value: boolean) => {
     if (!greenhouse) return
@@ -777,7 +1147,13 @@ function App() {
             <div className="grid gap-4">
               {sensorDefs.map((def) => {
                 const v = live?.[def.key]
-                return <SensorCard key={def.key} target={targetFor(def.key)} label={def.label} unit={def.unit} icon={def.icon} tone={def.tone} value={typeof v === "number" ? String(Math.round(v * 10) / 10) : "—"} progress={typeof v === "number" ? Math.max(0, Math.min(100, (v / def.max) * 100)) : 0} />
+                const isLux = def.key === "lightLux"
+                const shown = typeof v === "number" ? String(isLux ? Math.round(v) : Math.round(v * 10) / 10) : "—"
+                // Light spans from a few lux to tens of thousands, so its bar uses a log scale (1 lx to 100,000 lx)
+                const pct = typeof v === "number"
+                  ? (isLux ? Math.max(0, Math.min(100, (Math.log10(v + 1) / 5) * 100)) : Math.max(0, Math.min(100, (v / def.max) * 100)))
+                  : 0
+                return <SensorCard key={def.key} target={targetFor(def.key)} label={def.label} unit={def.unit} icon={def.icon} tone={def.tone} value={shown} progress={pct} />
               })}
             </div>
           </section>
@@ -832,6 +1208,11 @@ function App() {
               onStop={() => {
                 if (!greenhouse) return
                 remove(ref(db, `greenhouses/${greenhouse.id}/meta/plan`)).catch((e) => console.error(e))
+                if (user) {
+                  delete syncedPlans.current[greenhouse.id]
+                  setDoc(doc(firestore, "users", user.uid, "devices", greenhouse.id), { plan: deleteField() }, { merge: true })
+                    .catch((e) => console.error("Plant cycle backup removal failed:", e))
+                }
               }}
             />
           )}
@@ -916,15 +1297,35 @@ function App() {
           greenhouses={greenhouses}
           currentGreenhouse={currentGreenhouse}
           now={now}
+          notifPrefs={notifPrefs}
+          onNotifPrefs={updateNotifPrefs}
           wifiSettings={wifiSettings}
-          onUpdateWifi={async (settings) => {
+            onUpdateWifi={async (settings, onStep) => {
             if (!user || !greenhouse) return
+            const step = onStep ?? (() => {})
+
+            const deviceRef = doc(firestore, "users", user.uid, "devices", greenhouse.id)
+            const saved = await getDoc(deviceRef)
+            const claimCode = saved.exists() ? (saved.data().claimCode as string | undefined) : undefined
+            if (!claimCode) {
+              throw new Error("This hub's setup code isn't saved on your phone. Remove the greenhouse and add it again with Bluetooth once.")
+            }
+
+            // Bluetooth wakes up, finds the hub and hands it the new Wi-Fi
+            const hubDeviceId = await connectToHub(greenhouse.id, step)
+            try {
+              await sendWifiToHub(hubDeviceId, claimCode, settings.ssid, settings.password, step)
+            } finally {
+              await disconnectHub(hubDeviceId)
+            }
+
+            // The hub confirmed it joined, so keep the same details on the phone
             await setDoc(
-              doc(firestore, "users", user.uid, "devices", greenhouse.id),
+              deviceRef,
               { name: settings.deviceName, greenhouseId: greenhouse.id, ssid: settings.ssid, wifiPassword: settings.password, status: "configured", updatedAt: serverTimestamp() },
               { merge: true }
             )
-            await set(ref(db, `greenhouses/${greenhouse.id}/wifi`), { ssid: settings.ssid, password: settings.password, ts: Date.now() })
+            await saveNetwork(user.uid, settings.ssid, settings.password).catch(() => {})
             setWifiSettings(settings)
           }}
           onSwitch={(index) => setCurrentGreenhouse(index)}
@@ -1406,24 +1807,35 @@ function WifiSetupScreen({
   const [busy, setBusy] = useState(false)
   const [step, setStep] = useState("")
   const [error, setError] = useState("")
+  const [networks, setNetworks] = useState<SavedNetwork[]>([])
+  const [networkChoice, setNetworkChoice] = useState("new")   // a saved network's id, or "new"
 
   const connected = hubDeviceId !== ""
   const hubName = `TerraSense-${greenhouseId.trim().toUpperCase().slice(6)}`
 
   // Offer the Wi-Fi details already saved in the app, so they don't need retyping
+    // Saved Wi-Fi networks: pick one, or add a new one
   useEffect(() => {
     const user = auth.currentUser
     if (!user) return
-    getDocs(collection(firestore, "users", user.uid, "devices"))
-      .then((snap) => {
-        const saved = snap.docs.map((d) => d.data()).find((d) => d.ssid)
-        if (saved) {
-          setSsid((current) => current || saved.ssid)
-          setPassword((current) => current || saved.wifiPassword || "")
+    loadNetworks(user.uid)
+      .then((list) => {
+        setNetworks(list)
+        if (list.length > 0) {
+          setNetworkChoice(list[0].id)
+          setSsid(list[0].ssid)
+          setPassword(list[0].password)
         }
       })
       .catch(() => {})
   }, [])
+
+  const chooseNetwork = (id: string) => {
+    setNetworkChoice(id)
+    const net = networks.find((n) => n.id === id)
+    setSsid(net?.ssid ?? "")
+    setPassword(net?.password ?? "")
+  }
 
   // Page 1: find the hub over Bluetooth and connect
   const searchHub = async (event: React.FormEvent) => {
@@ -1627,6 +2039,24 @@ function WifiSetupScreen({
             </div>
 
             <form onSubmit={sendWifi} className="mt-8 space-y-5">
+                  {networks.length > 0 && (
+                <div>
+                  <label htmlFor="setup-network" className="mb-2 block text-[11px] font-bold uppercase tracking-wider text-muted">
+                    Saved networks
+                  </label>
+                  <select
+                    id="setup-network"
+                    value={networkChoice}
+                    onChange={(e) => chooseNetwork(e.target.value)}
+                    className="w-full rounded-2xl border border-border bg-white px-4 py-3.5 text-sm font-medium text-ink"
+                  >
+                    {networks.map((n) => (
+                      <option key={n.id} value={n.id}>{n.ssid}</option>
+                    ))}
+                    <option value="new">Add a new network…</option>
+                  </select>
+                </div>
+              )}
               <AuthField id="setup-ssid" label="Wi-Fi network name" type="text" value={ssid} onChange={setSsid} placeholder="Enter network SSID" />
               <AuthField id="setup-wifi-password" label="Wi-Fi password" type="password" value={password} onChange={setPassword} placeholder="Enter network password" />
 
@@ -1899,6 +2329,7 @@ const analyticsMetrics = [
   { key: "temperature", label: "Temperature", unit: "°C" },
   { key: "humidity", label: "Humidity", unit: "%" },
   { key: "soilMoisture", label: "Soil moisture", unit: "%" },
+  { key: "lightLux", label: "Light", unit: " lx" },
 ] as const
 
 function AnalyticsPage({ rows }: { rows: HistoryRow[] }) {
@@ -1907,15 +2338,15 @@ function AnalyticsPage({ rows }: { rows: HistoryRow[] }) {
   const values = rows.map((r) => r[metric]).filter((v): v is number => typeof v === "number")
   const has = values.length > 0
   const avg = has ? values.reduce((a, b) => a + b, 0) / values.length : 0
-  const fmt = (n: number) => `${Math.round(n * 10) / 10}${def.unit}`
+  const fmt = (n: number) => `${metric === "lightLux" ? Math.round(n) : Math.round(n * 10) / 10}${def.unit}`
   const detail = has ? `Last ${values.length} readings` : "No readings yet"
   const lower = def.label.toLowerCase()
   return (
     <section className="space-y-5">
       <div><p role="heading" aria-level={2} className="text-2xl font-bold tracking-tight">Greenhouse analytics</p><p className="mt-1 text-sm text-muted">Based on readings recorded by your TerraSense hub.</p></div>
-      <div className="flex gap-2">
+      <div className="island-scroll flex gap-2 overflow-x-auto">
         {analyticsMetrics.map((m) => (
-          <button key={m.key} onClick={() => setMetric(m.key)} className={`rounded-full px-4 py-2 text-xs font-bold transition ${metric === m.key ? "bg-forest text-white" : "border border-border bg-white text-muted"}`}>{m.label}</button>
+          <button key={m.key} onClick={() => setMetric(m.key)} className={`shrink-0 rounded-full px-4 py-2 text-xs font-bold transition ${metric === m.key ? "bg-forest text-white" : "border border-border bg-white text-muted"}`}>{m.label}</button>
         ))}
       </div>
       <div className="grid gap-4">
@@ -1935,6 +2366,31 @@ function Metric({ label, value, detail }: { label: string; value: string; detail
   return <div className="rounded-2xl border border-border bg-white p-5 shadow-card"><p className="text-xs font-medium text-muted">{label}</p><p className="mt-2 text-2xl font-bold">{value}</p><p className="mt-2 text-xs text-leaf">{detail}</p></div>
 }
 
+function NotifRow({ icon, title, detail, on, onToggle }: { icon: IconName; title: string; detail: string; on: boolean; onToggle: () => void }) {
+  return (
+    <div className="flex items-center justify-between gap-3 px-4 py-4">
+      <div className="flex min-w-0 items-center gap-3">
+        <div className="grid size-10 shrink-0 place-items-center rounded-xl bg-black/5">
+          <Icon name={icon} size={18} />
+        </div>
+        <div className="min-w-0">
+          <p className="text-sm font-bold text-ink">{title}</p>
+          <p className="mt-1 text-xs text-black/40">{detail}</p>
+        </div>
+      </div>
+      <button
+        onClick={onToggle}
+        role="switch"
+        aria-checked={on}
+        aria-label={`Toggle ${title}`}
+        className={`relative h-6 w-11 shrink-0 rounded-full transition ${on ? "bg-forest" : "bg-black/15"}`}
+      >
+        <span className={`absolute top-1 size-4 rounded-full bg-white shadow-sm transition ${on ? "left-6" : "left-1"}`} />
+      </button>
+    </div>
+  )
+}
+
 function ProfilePanel({
   shown,
   onClose,
@@ -1949,6 +2405,8 @@ function ProfilePanel({
   wifiSettings,
   onUpdateWifi,
   now,
+  notifPrefs,
+  onNotifPrefs,
 }: {
   shown: boolean
   onClose: () => void
@@ -1961,10 +2419,11 @@ function ProfilePanel({
   onEdit: (id: string, data: { name: string; location: string }) => Promise<void>
   onRemove: (id: string) => Promise<void>
   wifiSettings: WifiSettings
-  onUpdateWifi: (settings: WifiSettings) => Promise<void>
+  onUpdateWifi: (settings: WifiSettings, onStep?: (message: string) => void) => Promise<void>
   now: number
+  notifPrefs: NotifPrefs
+  onNotifPrefs: (next: NotifPrefs) => void
 }) {
-  const [notifications, setNotifications] = useState(true)
   const [addingGreenhouse, setAddingGreenhouse] = useState(false)
   const [editingWifi, setEditingWifi] = useState(false)
 
@@ -1980,6 +2439,69 @@ function ProfilePanel({
     useState<WifiSettings>(safeWifiSettings)
 
   const [wifiSynced, setWifiSynced] = useState(true)
+  const [wifiStep, setWifiStep] = useState("")
+    const [savedNetworks, setSavedNetworks] = useState<SavedNetwork[]>([])
+  const [networkChoice, setNetworkChoice] = useState("new")   // a saved network's id, or "new"
+
+  // Load the saved networks whenever the Wi-Fi editor opens
+  useEffect(() => {
+    const u = auth.currentUser
+    if (!u) return
+    loadNetworks(u.uid)
+      .then((list) => {
+        setSavedNetworks(list)
+        const match = list.find((n) => n.ssid === wifiDraft.ssid)
+        setNetworkChoice(match ? match.id : "new")
+      })
+      .catch(() => {})
+  }, [editingWifi])
+
+  const chooseSavedNetwork = (id: string) => {
+    setNetworkChoice(id)
+    const net = savedNetworks.find((n) => n.id === id)
+    setWifiDraft((current) => ({ ...current, ssid: net?.ssid ?? "", password: net?.password ?? "" }))
+  }
+
+  const deleteSavedNetwork = async () => {
+    const u = auth.currentUser
+    if (!u || networkChoice === "new") return
+    await deleteNetwork(u.uid, networkChoice).catch(() => {})
+    setSavedNetworks((list) => list.filter((n) => n.id !== networkChoice))
+    setNetworkChoice("new")
+    setWifiDraft((current) => ({ ...current, ssid: "", password: "" }))
+  }
+  const [newNetSsid, setNewNetSsid] = useState("")
+  const [newNetPass, setNewNetPass] = useState("")
+  const [netBusy, setNetBusy] = useState(false)
+  const [netError, setNetError] = useState("")
+
+  const addNetwork = async () => {
+    const u = auth.currentUser
+    if (!u || !newNetSsid.trim() || !newNetPass) return
+    try {
+      setNetBusy(true)
+      setNetError("")
+      await saveNetwork(u.uid, newNetSsid.trim(), newNetPass)
+      setSavedNetworks(await loadNetworks(u.uid))
+      setNewNetSsid("")
+      setNewNetPass("")
+    } catch (e: any) {
+      console.error("Save network error:", e)
+      setNetError(e?.message || "Couldn't save the network. Please try again.")
+    } finally {
+      setNetBusy(false)
+    }
+  }
+
+  const removeNetwork = async (id: string) => {
+    const u = auth.currentUser
+    if (!u) return
+    await deleteNetwork(u.uid, id).catch(() => {})
+    setSavedNetworks((list) => list.filter((n) => n.id !== id))
+    if (networkChoice === id) setNetworkChoice("new")
+  }
+
+  const [wifiError, setWifiError] = useState("")
   const [newGreenhouseId, setNewGreenhouseId] = useState("")
   const [newGreenhouseCode, setNewGreenhouseCode] = useState("")
   const [newGreenhouseName, setNewGreenhouseName] = useState("")
@@ -2080,7 +2602,7 @@ function ProfilePanel({
     }
   }
 
-  const saveWifi = async () => {
+   const saveWifi = async () => {
     const deviceName = wifiDraft.deviceName.trim()
     const ssid = wifiDraft.ssid.trim()
     const password = wifiDraft.password
@@ -2090,21 +2612,26 @@ function ProfilePanel({
     }
 
     setWifiSynced(false)
+    setWifiError("")
 
     try {
-      await onUpdateWifi({
-        deviceName: deviceName || "TerraSense Hub",
-        ssid,
-        password,
-      })
+      await onUpdateWifi(
+        {
+          deviceName: deviceName || "TerraSense Hub",
+          ssid,
+          password,
+        },
+        setWifiStep
+      )
       setEditingWifi(false)
-    } catch (e) {
+    } catch (e: any) {
       console.error("Wi-Fi save error:", e)
+      setWifiError(e?.message || "Couldn't send the Wi-Fi to your hub. Please try again.")
     } finally {
       setWifiSynced(true)
+      setWifiStep("")
     }
   }
-
   const startWifiEdit = () => {
     setWifiDraft({
       deviceName: safeWifiSettings.deviceName,
@@ -2443,6 +2970,34 @@ function ProfilePanel({
                 <div>
                   <div className="space-y-4">
 
+                      {savedNetworks.length > 0 && (
+                      <div>
+                        <label className="mb-2 block text-[11px] font-bold uppercase tracking-wider text-black/40">
+                          Saved networks
+                        </label>
+                        <div className="flex gap-2">
+                          <select
+                            value={networkChoice}
+                            onChange={(e) => chooseSavedNetwork(e.target.value)}
+                            className="min-w-0 flex-1 rounded-xl border border-black/10 bg-white px-3 py-3 text-sm font-medium"
+                          >
+                            {savedNetworks.map((n) => (
+                              <option key={n.id} value={n.id}>{n.ssid}</option>
+                            ))}
+                            <option value="new">Add a new network…</option>
+                          </select>
+                          {networkChoice !== "new" && (
+                            <button
+                              type="button"
+                              onClick={deleteSavedNetwork}
+                              className="rounded-xl bg-red-50 px-3 text-xs font-bold text-red-600"
+                            >
+                              Delete
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
                     <AuthField
                       label="Device name"
                       value={wifiDraft.deviceName}
@@ -2481,6 +3036,11 @@ function ProfilePanel({
                     />
                   </div>
 
+                  {wifiError && (
+                    <p className="mt-4 rounded-xl bg-red-50 px-4 py-3 text-xs font-medium text-red-600">
+                      {wifiError}
+                    </p>
+                  )}
                   <div className="mt-4 flex gap-2">
                     <button
                       onClick={saveWifi}
@@ -2491,7 +3051,7 @@ function ProfilePanel({
                       }
                       className="flex-1 rounded-xl bg-forest px-4 py-3 text-sm font-bold text-white disabled:cursor-not-allowed disabled:opacity-50"
                     >
-                      {wifiSynced ? "Save Wi-Fi" : "Syncing..."}
+                      {wifiSynced ? "Save Wi-Fi" : (wifiStep || "Syncing...")}
                     </button>
 
                     <button
@@ -2514,44 +3074,77 @@ function ProfilePanel({
             </div>
           </section>
 
+          {/* Saved Wi-Fi networks: kept on the account, even with no greenhouse added */}
+          <section className="mt-6">
+            <div className="mb-3">
+              <h3 className="text-base font-bold text-ink">Saved Wi-Fi networks</h3>
+              <p className="mt-1 text-xs text-black/40">
+                Kept on your account until you change or delete them. Pick any of them when you set up a hub or change its Wi-Fi.
+              </p>
+            </div>
+
+            <div className="rounded-2xl border border-black/10 bg-black/[0.025] p-4">
+              {savedNetworks.length === 0 ? (
+                <p className="text-xs text-black/40">No saved networks yet.</p>
+              ) : (
+                <ul className="divide-y divide-black/5">
+                  {savedNetworks.map((n) => (
+                    <li key={n.id} className="flex items-center gap-3 py-2.5 first:pt-0">
+                      <div className="grid size-9 shrink-0 place-items-center rounded-xl bg-forest text-white">
+                        <Icon name="wifi" size={16} />
+                      </div>
+                      <p className="min-w-0 flex-1 truncate text-sm font-bold text-ink">{n.ssid}</p>
+                      <button
+                        type="button"
+                        onClick={() => removeNetwork(n.id)}
+                        className="rounded-lg bg-red-50 px-2.5 py-1.5 text-[11px] font-bold text-red-600"
+                      >
+                        Delete
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              <div className="mt-4 space-y-3 border-t border-black/5 pt-4">
+                <AuthField label="Network name" value={newNetSsid} onChange={setNewNetSsid} placeholder="Wi-Fi name" />
+                <AuthField label="Password" type="password" value={newNetPass} onChange={setNewNetPass} placeholder="Wi-Fi password" />
+                {netError && (
+                  <p className="rounded-xl bg-red-50 px-4 py-3 text-xs font-medium text-red-600">{netError}</p>
+                )}
+                <button
+                  type="button"
+                  onClick={addNetwork}
+                  disabled={netBusy || !newNetSsid.trim() || !newNetPass}
+                  className="w-full rounded-xl bg-forest px-4 py-3 text-sm font-bold text-white disabled:opacity-50"
+                >
+                  {netBusy ? "Saving…" : "Save network"}
+                </button>
+              </div>
+            </div>
+          </section>
+
           {/* Notifications */}
           <section className="mt-6">
-            <div className="flex items-center justify-between rounded-2xl border border-black/10 p-4">
-              <div className="flex items-center gap-3">
-                <div className="grid size-10 place-items-center rounded-xl bg-black/5">
-                  <Icon name="bell" size={18} />
-                </div>
+            <h3 className="mb-3 text-base font-bold text-ink">
+              Notifications
+            </h3>
 
-                <div>
-                  <p className="text-sm font-bold text-ink">
-                    Notifications
-                  </p>
-
-                  <p className="mt-1 text-xs text-black/40">
-                    Greenhouse alerts and updates
-                  </p>
-                </div>
-              </div>
-
-              <button
-                onClick={() =>
-                  setNotifications((value) => !value)
-                }
-                aria-label="Toggle notifications"
-                className={`relative h-6 w-11 rounded-full transition ${
-                  notifications
-                    ? "bg-forest"
-                    : "bg-black/15"
-                }`}
-              >
-                <span
-                  className={`absolute top-1 size-4 rounded-full bg-white shadow-sm transition ${
-                    notifications
-                      ? "left-6"
-                      : "left-1"
-                  }`}
-                />
-              </button>
+            <div className="divide-y divide-black/5 rounded-2xl border border-black/10">
+              <NotifRow
+                icon="bell"
+                title="Hub offline alerts"
+                detail="Notify me when a hub stops reporting"
+                on={notifPrefs.offline}
+                onToggle={() => onNotifPrefs({ ...notifPrefs, offline: !notifPrefs.offline })}
+              />
+              <NotifRow
+                icon="leaf"
+                title="Plant cycle status"
+                detail="Always-on card showing the current growth stage"
+                on={notifPrefs.cycle}
+                onToggle={() => onNotifPrefs({ ...notifPrefs, cycle: !notifPrefs.cycle })}
+              />
             </div>
           </section>
 
