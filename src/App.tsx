@@ -9,6 +9,7 @@ import {
 import { auth, db, firestore } from "./firebase"
 import { doc, setDoc, getDoc, serverTimestamp } from "firebase/firestore"
 import { ref, onValue, set, remove, update, query, limitToLast } from "firebase/database"
+import { BleClient, dataViewToText } from "@capacitor-community/bluetooth-le"
 
 
 
@@ -86,11 +87,61 @@ async function unlinkGreenhouse(uid: string, id: string) {
     await remove(ref(db, `${base}/controls`))
     await remove(ref(db, `${base}/live`))
     await remove(ref(db, `${base}/history`))
+    await remove(ref(db, `${base}/wifi`))
     await remove(ref(db, `${base}/meta`))
     await remove(ref(db, `${base}/ownerUid`))
   } catch (e) {
     if (isPermissionError(e)) throw new Error("You don't have permission to remove this greenhouse.")
     throw e
+  }
+}
+
+// ---- Bluetooth setup: the hub has no Wi-Fi yet, so the phone hands it the credentials ----
+const BLE_SERVICE = "7e1a0001-5c0b-4b8e-9d3a-2f4b6c7d8e90"
+const BLE_PROV    = "7e1a0002-5c0b-4b8e-9d3a-2f4b6c7d8e90"
+const BLE_STATUS  = "7e1a0003-5c0b-4b8e-9d3a-2f4b6c7d8e90"
+
+const bleErrors: Record<string, string> = {
+  "error:bad_code": "That claim code doesn't match this hub.",
+  "error:wifi_failed": "The hub couldn't join that Wi-Fi. Check the name and password (it must be 2.4 GHz).",
+  "error:bad_json": "Setup data got garbled. Please try again.",
+  "error:bad_ssid": "Enter a valid Wi-Fi network name.",
+}
+
+async function provisionHubOverBle(
+  ghId: string, code: string, ssid: string, pass: string, onStep: (message: string) => void
+) {
+  const id = ghId.trim().toUpperCase()
+  if (!GH_ID_PATTERN.test(id)) throw new Error("Enter a valid ID in the format TS-GH-XXXX.")
+
+  await BleClient.initialize({ androidNeverForLocation: true })
+  onStep("Looking for your hub…")
+  let deviceId: string
+  try {
+    const device = await BleClient.requestDevice({ services: [BLE_SERVICE], name: `TerraSense-${id.slice(6)}` })
+    deviceId = device.deviceId
+  } catch {
+    throw new Error("No hub found. Check that it is powered on, nearby, and that Bluetooth is on.")
+  }
+
+  onStep("Connecting…")
+  await BleClient.connect(deviceId)
+  try {
+    const bytes = new TextEncoder().encode(JSON.stringify({ ssid, pass, code: code.trim().toUpperCase() }) + "\n")
+    for (let i = 0; i < bytes.length; i += 18) {   // 18-byte chunks work with any BLE MTU
+      const chunk = bytes.slice(i, i + 18)
+      await BleClient.write(deviceId, BLE_SERVICE, BLE_PROV, new DataView(chunk.buffer))
+    }
+    onStep("Hub is joining your Wi-Fi…")
+    for (let i = 0; i < 30; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+      const status = dataViewToText(await BleClient.read(deviceId, BLE_SERVICE, BLE_STATUS))
+      if (status === "wifi_ok") return
+      if (status.startsWith("error:")) throw new Error(bleErrors[status] ?? "Setup failed. Please try again.")
+    }
+    throw new Error("The hub didn't report back. Check the Wi-Fi password and try again.")
+  } finally {
+    await BleClient.disconnect(deviceId).catch(() => {})
   }
 }
 
@@ -182,6 +233,8 @@ type LiveData = {
   fertilizer?: number
   updatedAt?: number
 }
+
+type HistoryRow = { temperature?: number; humidity?: number; soilMoisture?: number }
 
 type StageDef = {
   key: string
@@ -344,6 +397,7 @@ function App() {
   const [live, setLive] = useState<LiveData | null>(null)
   const [controlState, setControlState] = useState<Record<string, boolean>>({})
   const [history, setHistory] = useState<number[]>([])
+  const [historyRows, setHistoryRows] = useState<HistoryRow[]>([])
   const [now, setNow] = useState(() => Date.now())
 
   const greenhouses: Greenhouse[] = useMemo(
@@ -467,17 +521,23 @@ function App() {
     setLive(null)
     setControlState({})
     setHistory([])
+    setHistoryRows([])
     if (!currentId) return
     const base = `greenhouses/${currentId}`
     const offLive = onValue(ref(db, `${base}/live`), (s) => setLive(s.val() ?? {}))
     const offControls = onValue(ref(db, `${base}/controls`), (s) => setControlState(s.val() ?? {}))
     const offHistory = onValue(query(ref(db, `${base}/history`), limitToLast(48)), (s) => {
       const rows: number[] = []
+      const full: HistoryRow[] = []
+      const num = (x: any) => (x != null && Number.isFinite(Number(x)) ? Number(x) : undefined)
       s.forEach((child) => {
-        const t = Number(child.val()?.temperature)
-        if (Number.isFinite(t)) rows.push(t)
+        const v = child.val() ?? {}
+        const t = num(v.temperature)
+        if (t !== undefined) rows.push(t)
+        full.push({ temperature: t, humidity: num(v.humidity), soilMoisture: num(v.soilMoisture) })
       })
       setHistory(rows)
+      setHistoryRows(full)
     })
     return () => { offLive(); offControls(); offHistory() }
   }, [currentId])
@@ -729,7 +789,7 @@ function App() {
               }}
             />
           )}
-          {activeNav === "Analytics" && (loading ? <LoadingState /> : hasDevice ? <AnalyticsPage history={history} /> : <NoDeviceState section="Analytics" onConnect={() => setProfileOpen(true)} />)}
+          {activeNav === "Analytics" && (loading ? <LoadingState /> : hasDevice ? <AnalyticsPage rows={historyRows} /> : <NoDeviceState section="Analytics" onConnect={() => setProfileOpen(true)} />)}
         </div>
         <nav className="fixed bottom-[max(0.75rem,env(safe-area-inset-bottom))] left-1/2 z-40 flex w-[calc(100%-3rem)] max-w-sm -translate-x-1/2 items-center rounded-3xl border border-white/70 bg-white p-1.5 shadow-[0_12px_40px_rgb(23_59_44_/_0.18)]">
           {navItems.map((item) => (
@@ -803,6 +863,7 @@ function App() {
               { name: settings.deviceName, greenhouseId: greenhouse.id, ssid: settings.ssid, wifiPassword: settings.password, status: "configured", updatedAt: serverTimestamp() },
               { merge: true }
             )
+            await set(ref(db, `greenhouses/${greenhouse.id}/wifi`), { ssid: settings.ssid, password: settings.password, ts: Date.now() })
             setWifiSettings(settings)
           }}
           onSwitch={(index) => setCurrentGreenhouse(index)}
@@ -1280,6 +1341,7 @@ function WifiSetupScreen({
   const [password, setPassword] = useState("")
   const [deviceName, setDeviceName] = useState("TerraSense Hub")
   const [sharing, setSharing] = useState(false)
+  const [step, setStep] = useState("")
   const [error, setError] = useState("")
 
   const connectDevice = async (event: React.FormEvent) => {
@@ -1306,6 +1368,10 @@ function WifiSetupScreen({
     try {
       setSharing(true)
       setError("")
+
+      // 0) Hand the Wi-Fi details to the hub over Bluetooth (it has no network yet)
+      await provisionHubOverBle(greenhouseId, claimCode, ssid.trim(), password, setStep)
+      setStep("Linking to your account…")
 
       // 1) Claim the ESP32 hub so Firebase links it to THIS user
       const id = await claimGreenhouse(user.uid, {
@@ -1336,6 +1402,7 @@ function WifiSetupScreen({
       setError(e?.message || "Unable to connect the device. Please try again.")
     } finally {
       setSharing(false)
+      setStep("")
     }
   }
 
@@ -1393,7 +1460,7 @@ function WifiSetupScreen({
             <Icon name="bolt" size={18} />
 
             <p className="text-[10px] leading-4">
-              Keep your TerraSense device powered on and connected to the internet while it is being linked.
+              Keep your TerraSense hub powered on and within a few meters of your phone, with Bluetooth turned on.
             </p>
           </div>
 
@@ -1405,7 +1472,7 @@ function WifiSetupScreen({
             {sharing ? (
               <>
                 <span className="size-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
-                Linking device…
+                {step || "Linking device…"}
               </>
             ) : (
               "Connect TerraSense device"
@@ -1655,21 +1722,37 @@ function NoDeviceState({ section, onConnect }: { section: "Overview" | "Analytic
   )
 }
 
-function AnalyticsPage({ history }: { history: number[] }) {
-  const has = history.length > 0
-  const avg = has ? history.reduce((a, b) => a + b, 0) / history.length : 0
-  const fmt = (n: number) => `${(Math.round(n * 10) / 10).toString()}°C`
+const analyticsMetrics = [
+  { key: "temperature", label: "Temperature", unit: "°C" },
+  { key: "humidity", label: "Humidity", unit: "%" },
+  { key: "soilMoisture", label: "Soil moisture", unit: "%" },
+] as const
+
+function AnalyticsPage({ rows }: { rows: HistoryRow[] }) {
+  const [metric, setMetric] = useState<(typeof analyticsMetrics)[number]["key"]>("temperature")
+  const def = analyticsMetrics.find((m) => m.key === metric)!
+  const values = rows.map((r) => r[metric]).filter((v): v is number => typeof v === "number")
+  const has = values.length > 0
+  const avg = has ? values.reduce((a, b) => a + b, 0) / values.length : 0
+  const fmt = (n: number) => `${Math.round(n * 10) / 10}${def.unit}`
+  const detail = has ? `Last ${values.length} readings` : "No readings yet"
+  const lower = def.label.toLowerCase()
   return (
     <section className="space-y-5">
       <div><p role="heading" aria-level={2} className="text-2xl font-bold tracking-tight">Greenhouse analytics</p><p className="mt-1 text-sm text-muted">Based on readings recorded by your TerraSense hub.</p></div>
+      <div className="flex gap-2">
+        {analyticsMetrics.map((m) => (
+          <button key={m.key} onClick={() => setMetric(m.key)} className={`rounded-full px-4 py-2 text-xs font-bold transition ${metric === m.key ? "bg-forest text-white" : "border border-border bg-white text-muted"}`}>{m.label}</button>
+        ))}
+      </div>
       <div className="grid gap-4">
-        <Metric label="Average temperature" value={has ? fmt(avg) : "—"} detail={has ? `Last ${history.length} readings` : "No readings yet"} />
-        <Metric label="Highest temperature" value={has ? fmt(Math.max(...history)) : "—"} detail={has ? `Last ${history.length} readings` : "No readings yet"} />
-        <Metric label="Lowest temperature" value={has ? fmt(Math.min(...history)) : "—"} detail={has ? `Last ${history.length} readings` : "No readings yet"} />
+        <Metric label={`Average ${lower}`} value={has ? fmt(avg) : "—"} detail={detail} />
+        <Metric label={`Highest ${lower}`} value={has ? fmt(Math.max(...values)) : "—"} detail={detail} />
+        <Metric label={`Lowest ${lower}`} value={has ? fmt(Math.min(...values)) : "—"} detail={detail} />
       </div>
       <div className="rounded-3xl border border-border bg-white p-6 shadow-card">
-        <p className="text-base font-bold">Temperature history</p>
-        <div className="mt-8"><Sparkline values={history} /></div>
+        <p className="text-base font-bold">{def.label} history</p>
+        <div className="mt-8"><Sparkline values={values} /></div>
       </div>
     </section>
   )
