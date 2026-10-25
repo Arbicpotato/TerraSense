@@ -1059,6 +1059,73 @@ function App() {
         if (soilNow !== null && soilNow < cycle.stage.moistureMin) alerts.push("Soil is drier than target")
       }
 
+      // Plant buddy widget: which plant it is, how grown it is, and what mood it is in
+      const petName = String(greenhouse.plan?.name ?? greenhouse.crop ?? "").toLowerCase()
+      const petPlant = /tomato/.test(petName) ? "tomato"
+        : /lettuce|spinach|kale/.test(petName) ? "lettuce"
+        : /chil+i|pepper|capsicum/.test(petName) ? "pepper"
+        : /strawberr/.test(petName) ? "strawberry"
+        : /cucumber|zucchini/.test(petName) ? "cucumber"
+        : "basil"
+      const petStageList = greenhouse.plan?.stages ?? []
+      let petStage = 0
+      if (cycle) {
+        const sn = (cycle.finished ? "harvest" : cycle.stage.name).toLowerCase()
+        const si = Math.max(0, petStageList.findIndex((st) => st.key === cycle.stage.key))
+        petStage = /seed|germ/.test(sn) ? 0
+          : /veget|growth/.test(sn) ? 1
+          : /flower|bloom/.test(sn) ? 2
+          : /fruit|harvest|ripe|complete/.test(sn) ? 3
+          : petStageList.length > 1 ? Math.min(3, Math.round((si * 3) / (petStageList.length - 1))) : 0
+      }
+      // Celebrate for 3 hours after a new stage starts (the first run only records the stage)
+      let petJustChanged = false
+      if (cycle && !cycle.finished) {
+        try {
+          const k = `ts_stage_${greenhouse.id}`
+          const stageId = `${greenhouse.plan?.startedAt ?? 0}_${cycle.stage.key}`
+          const seen = JSON.parse(localStorage.getItem(k) || "null")
+          if (!seen || seen.id !== stageId) {
+            localStorage.setItem(k, JSON.stringify({ id: stageId, since: seen ? Date.now() : 0 }))
+            petJustChanged = !!seen
+          } else {
+            petJustChanged = Date.now() - (Number(seen.since) || 0) < 3 * 3600 * 1000
+          }
+        } catch {}
+      }
+      const petStageDef = cycle && !cycle.finished ? cycle.stage : null
+      const petTempMax = petStageDef?.tempMax || 32
+      const petTempMin = petStageDef?.tempMin || 15
+      const petSoilMin = petStageDef?.moistureMin || 30
+      const petTemp = num(live?.temperature), petSoil = num(live?.soilMoisture)
+      const petHour = new Date().getHours()
+      // Each plant's pet name (change the names here)
+      const PET_NAMES: Record<string, string> = {
+        cucumber: "Pickles",
+        strawberry: "Berry",
+        tomato: "Pomodoro",
+        lettuce: "Buttercup",
+        basil: "Basilisk",
+        pepper: "Pepper",
+      }
+      const pn = PET_NAMES[petPlant] ?? "Your plant"
+      let petMood = "happy", petMsg = `${pn} is feeling happy!`
+      if (!online) { petMood = "sleep"; petMsg = `${pn} can't reach the hub...` }
+      else if (stopped) { petMood = "sleep"; petMsg = `${pn} is paused and resting` }
+      else if (petHour >= 22 || petHour < 5) { petMood = "sleep"; petMsg = `${pn} is sleeping. Zzz...` }
+      else if (petJustChanged) { petMood = "celebrate"; petMsg = `${pn} just reached ${petStageDef?.name ?? "a new stage"}!` }
+      else if (acts.pump) { petMood = "drink"; petMsg = `${pn} is having a drink!` }
+      else if (petTemp !== null && petTemp > petTempMax) { petMood = "hot"; petMsg = `${pn} is feeling hot!` }
+      else if (petTemp !== null && petTemp < petTempMin) { petMood = "cold"; petMsg = `${pn} is feeling cold!` }
+      else if (petSoil !== null && petSoil < petSoilMin) { petMood = "thirsty"; petMsg = `${pn} is feeling thirsty!` }
+      const pet = {
+        plant: petPlant,
+        mood: petMood,
+        msg: petMsg,
+        stage: petStage,
+        label: greenhouse.plan && cycle ? `${pn} · ${cycle.finished ? "Complete" : cycle.stage.name}` : greenhouse.name,
+      }
+
       payload = {
         hasHub: true,
         id: greenhouse.id,
@@ -1073,6 +1140,7 @@ function App() {
         tank: tankPct,
         feed: feedPct,
         notes: online ? alerts : [],
+        pet,
         action: actions.join(" · "),
         acts,
         ctl,

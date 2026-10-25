@@ -32,8 +32,9 @@ import java.util.Locale;
 /**
  * TerraSense home-screen widget.
  *  - Shows readings, the plant cycle and what the hub is doing for one greenhouse.
- *  - ‹ › switch greenhouse. The device buttons, Auto/Manual and Stop work right from the widget
- *    (no need to open the app). Tapping the leaf opens the app.
+ *  - ‹ › switch greenhouse (always shown while the user owns more than one, even if one is offline).
+ *  - The device buttons work right from the widget while the app has the hub in Manual mode.
+ *    There are no Auto/Manual or Stop/Resume buttons on the widget. Tapping the leaf opens the app.
  *  - Resizable: it shows more sections the taller it is made.
  */
 public class TerraSenseWidget extends AppWidgetProvider {
@@ -69,6 +70,27 @@ public class TerraSenseWidget extends AppWidgetProvider {
             e.apply();
         } catch (Exception ignored) { }
         refreshAll(ctx);
+        PetWidget.refreshAll(ctx);        // the plant buddy widget reads the same saved data
+    }
+
+    private static String listName(JSONArray list, String id) {
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject it = list.optJSONObject(i);
+            if (it != null && it.optString("id").equals(id)) return it.optString("name", "Greenhouse");
+        }
+        return "Greenhouse";
+    }
+
+    private static String dotsFor(JSONArray list, String sel, int w) {
+        StringBuilder dots = new StringBuilder();
+        if (list.length() > 1 && w >= 230) {
+            for (int i = 0; i < list.length() && i < 6; i++) {
+                JSONObject it = list.optJSONObject(i);
+                dots.append(it != null && it.optString("id").equals(sel) ? "●" : "○");
+                if (i < list.length() - 1 && i < 5) dots.append(" ");
+            }
+        }
+        return dots.toString();
     }
 
     // ---------------------------------------------------------------- provider callbacks
@@ -96,6 +118,7 @@ public class TerraSenseWidget extends AppWidgetProvider {
         if (ACTION_PREV.equals(a) || ACTION_NEXT.equals(a)) {
             shift(ctx, ACTION_NEXT.equals(a) ? 1 : -1);
             refreshAll(ctx);
+            PetWidget.refreshAll(ctx);        // both widgets always show the same greenhouse
         } else if (ACTION_TOGGLE.equals(a)) {
             final String key = intent.getStringExtra("key");
             if (key == null) return;
@@ -136,15 +159,14 @@ public class TerraSenseWidget extends AppWidgetProvider {
         String fbRaw = p.getString("fb", null);
         if (raw == null || fbRaw == null) { toast(ctx, "Open TerraSense once to finish setting up the widget"); return; }
 
-        boolean device = !key.equals("manual") && !key.equals("emergencyStop");
         boolean cur, next;
         try {
             JSONObject o = new JSONObject(raw);
             JSONObject ctl = o.optJSONObject("ctl");
             if (ctl == null) ctl = new JSONObject();
             if (!o.optBoolean("online", false)) { toast(ctx, "Hub is offline"); return; }
-            if (device && ctl.optBoolean("emergencyStop")) { toast(ctx, "Emergency stop is on. Resume it in the app."); return; }
-            if (device && !ctl.optBoolean("manual")) { toast(ctx, "Switch to Manual mode in the app first"); return; }
+            if (ctl.optBoolean("emergencyStop")) { toast(ctx, "Emergency stop is on. Resume it in the app."); return; }
+            if (!ctl.optBoolean("manual")) { toast(ctx, "Switch to Manual mode in the app first"); return; }
             cur = ctl.optBoolean(key);
             next = !cur;
 
@@ -173,12 +195,7 @@ public class TerraSenseWidget extends AppWidgetProvider {
 
             JSONObject acts = o.optJSONObject("acts");
             if (acts == null) acts = new JSONObject();
-            if (key.equals("emergencyStop")) {
-                if (value) { for (String k : DEVICE_KEYS) acts.put(k, false); o.put("action", "Emergency stop"); }
-                else { o.put("action", "Resuming…"); }
-            } else if (!key.equals("manual")) {
-                acts.put(key, value);
-            }
+            acts.put(key, value);
             o.put("acts", acts);
             p.edit().putString("gh_" + sel, o.toString()).apply();
         } catch (Exception ignored) { }
@@ -333,12 +350,28 @@ public class TerraSenseWidget extends AppWidgetProvider {
         String sel = p.getString("selected", "");
         String raw = sel.isEmpty() ? null : p.getString("gh_" + sel, null);
         if (raw == null) {
-            v.setTextViewText(R.id.widget_name, "TerraSense");
-            v.setTextViewText(R.id.widget_status, "Tap the leaf to open the app");
             v.setViewVisibility(R.id.widget_body, View.GONE);
-            v.setTextViewText(R.id.widget_dots, "");
-            v.setViewVisibility(R.id.widget_prev, View.GONE);
-            v.setViewVisibility(R.id.widget_next, View.GONE);
+            JSONArray known;
+            try { known = new JSONArray(p.getString("list", "[]")); } catch (Exception e) { known = new JSONArray(); }
+            if (known.length() == 0) {
+                v.setTextViewText(R.id.widget_name, "TerraSense");
+                v.setTextViewText(R.id.widget_status, "Tap the leaf to open the app");
+                v.setTextViewText(R.id.widget_dots, "");
+                v.setViewVisibility(R.id.widget_prev, View.GONE);
+                v.setViewVisibility(R.id.widget_next, View.GONE);
+            } else {
+                // A greenhouse in the list that the widget has no reading for yet (for example it is offline
+                // and the app never showed it). Show it as a page of its own and keep the arrows, otherwise
+                // there is no way to switch away from it.
+                if (sel.isEmpty()) sel = known.optJSONObject(0).optString("id");
+                boolean many = known.length() > 1;
+                v.setTextViewText(R.id.widget_name, listName(known, sel));
+                v.setTextViewText(R.id.widget_status, "● Offline · no data yet");
+                v.setTextColor(R.id.widget_status, 0xFFFFB74D);
+                v.setTextViewText(R.id.widget_dots, dotsFor(known, sel, w));
+                v.setViewVisibility(R.id.widget_prev, many ? View.VISIBLE : View.GONE);
+                v.setViewVisibility(R.id.widget_next, many ? View.VISIBLE : View.GONE);
+            }
             return v;
         }
 
@@ -362,15 +395,7 @@ public class TerraSenseWidget extends AppWidgetProvider {
             v.setTextColor(R.id.widget_status, !online || noteCount > 0 ? 0xFFFFB74D : 0xFF9CE37D);
 
             // Page dots: which greenhouse is showing (hidden when the widget is narrow)
-            StringBuilder dots = new StringBuilder();
-            if (multi && w >= 230) {
-                String sel2 = o.optString("id");
-                for (int i = 0; i < list.length() && i < 6; i++) {
-                    dots.append(list.getJSONObject(i).optString("id").equals(sel2) ? "●" : "○");
-                    if (i < list.length() - 1 && i < 5) dots.append(" ");
-                }
-            }
-            v.setTextViewText(R.id.widget_dots, dots.toString());
+            v.setTextViewText(R.id.widget_dots, dotsFor(list, o.optString("id"), w));
 
             // Readings: icons are dropped at the smallest size; numbers grow when there is room
             float valueSize = compact ? 16f : (h >= 245 ? 20f : 18f);
