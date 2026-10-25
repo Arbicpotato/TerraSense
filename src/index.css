@@ -156,3 +156,11 @@ button:focus-visible {
     width: 100%;
   }
 }
+/* Append to the end of src/index.css: keep content clear of the camera notch when the phone is rotated */
+@media (orientation: landscape) {
+  body {
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+}
+
