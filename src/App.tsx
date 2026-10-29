@@ -88,7 +88,7 @@ async function claimGreenhouse(
     try {
       const backup = await getDoc(doc(firestore, "users", uid, "devices", id))
       const plan: any = backup.exists() ? backup.data().plan : undefined
-      if (plan && plan.stages) {
+      if (plan && (plan.stages || plan.plantId)) {
         const planAlready = (await get(ref(db, `greenhouses/${id}/meta/plan`))).exists()
         if (!planAlready) await set(ref(db, `greenhouses/${id}/meta/plan`), plan)
       }
@@ -118,7 +118,7 @@ async function unlinkGreenhouse(uid: string, id: string) {
   try {
     await remove(ref(db, `userGreenhouses/${uid}/${id}`))
     // Clean-up is best effort: a failure here must never block releasing ownership
-    for (const child of ["controls", "live", "history", "meta"]) {
+    for (const child of ["controls", "live", "history", "meta", "library"]) {
       await remove(ref(db, `${base}/${child}`)).catch(() => {})
     }
     // Last: the other rules check ownerUid, so it has to go after everything else
@@ -457,6 +457,7 @@ type IconName =
   | "close"
   | "plus"
   | "logout"
+  | "sliders"
 
 const iconPaths: Record<IconName, React.ReactNode> = {
   grid: <><rect x="3" y="3" width="7" height="7" rx="2" /><rect x="14" y="3" width="7" height="7" rx="2" /><rect x="3" y="14" width="7" height="7" rx="2" /><rect x="14" y="14" width="7" height="7" rx="2" /></>,
@@ -477,6 +478,7 @@ const iconPaths: Record<IconName, React.ReactNode> = {
   menu: <><path d="M4 7h16M4 12h16M4 17h16" /></>,
   close: <><path d="m6 6 12 12M18 6 6 18" /></>,
   plus: <path d="M12 5v14M5 12h14" />,
+  sliders: <><path d="M4 6h9M19 6h1M4 12h3M13 12h7M4 18h11M19 18h1" /><circle cx="16" cy="6" r="2" /><circle cx="10" cy="12" r="2" /><circle cx="17" cy="18" r="2" /></>,
   logout: <><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><path d="m16 17 5-5-5-5" /><path d="M21 12H9" /></>,
 }
 
@@ -486,6 +488,7 @@ function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
 
 const navItems: { label: string; icon: IconName }[] = [
   { label: "Overview", icon: "grid" },
+  { label: "Actions", icon: "sliders" },
   { label: "Analytics", icon: "chart" },
   { label: "Plants", icon: "leaf" },
   { label: "Plant Library", icon: "book" },
@@ -498,14 +501,24 @@ const sensorDefs = [
   { key: "lightLux", label: "Light", unit: "lx", icon: "sun" as IconName, tone: "purple", max: 100000 },
 ] as const
 
-const controlDefs: { key: string; name: string; icon: IconName }[] = [
-  { key: "pump", name: "Irrigation pump", icon: "droplet" },
-  { key: "lights", name: "Grow lights", icon: "sun" },
-  { key: "heater", name: "Heating system", icon: "thermometer" },
-  { key: "cooler", name: "Cooling system", icon: "wind" },
-  { key: "humidifier", name: "Humidifier", icon: "droplet" },
-  { key: "fertilizer", name: "Fertilizer pump", icon: "flask" },
+type ActuatorDef = { id: string; name: string; icon: IconName; relay: string; control?: string; group: string; tone: string; note?: string }
+
+// Every relay on the hub. "relay" is the key under /live/relays, "control" the switch used in manual mode.
+const actuatorDefs: ActuatorDef[] = [
+  { id: "fan", name: "Exhaust fan", icon: "wind", relay: "fan", control: "cooler", group: "Climate", tone: "blue" },
+  { id: "compressor", name: "Cooling compressor", icon: "bolt", relay: "compressor", group: "Climate", tone: "blue", note: "Automatic only" },
+  { id: "heater", name: "Heater", icon: "thermometer", relay: "heater", control: "heater", group: "Climate", tone: "amber" },
+  { id: "mister", name: "Humidifier / mister", icon: "droplet", relay: "humidifier", control: "humidifier", group: "Climate", tone: "blue" },
+  { id: "pump", name: "Irrigation pump", icon: "droplet", relay: "pump", control: "pump", group: "Water & feeding", tone: "green" },
+  { id: "valve", name: "Irrigation valve", icon: "grid", relay: "valve", group: "Water & feeding", tone: "green", note: "Follows the pump" },
+  { id: "fert", name: "Fertilizer pump", icon: "flask", relay: "fertilizer", control: "fertilizer", group: "Water & feeding", tone: "green" },
+  { id: "lights", name: "Grow lights", icon: "sun", relay: "lights", control: "lights", group: "Lighting", tone: "purple" },
 ]
+
+function runningActuators(live: LiveData | null, online: boolean, stopped: boolean) {
+  if (!online || stopped) return []
+  return actuatorDefs.filter((d) => live?.relays?.[d.relay] === true)
+}
 
 const ONLINE_WINDOW_MS = 2 * 60 * 1000
 const isOnline = (lastSeen: number | undefined, now: number) => !!lastSeen && now - lastSeen < ONLINE_WINDOW_MS
@@ -518,6 +531,23 @@ type LiveData = {
   waterTank?: number
   fertilizer?: number
   updatedAt?: number
+  relays?: Record<string, boolean>
+  actions?: Record<string, string>
+  mode?: string
+  blocked?: string
+  warn?: string
+  dayStart?: { minutes?: number; tzOffsetMin?: number }
+  // Plant profiles the hub has copied to its local storage, e.g. ",tomato,basil,"
+  library?: { ids?: string }
+  // The plant data the hub actually loaded and is controlling to
+  plan?: {
+    active?: boolean; plant?: string; stage?: string; stageNum?: number; stageCount?: number
+    day?: number; totalDays?: number
+    tempMin?: number; tempMax?: number; moistureMin?: number; moistureMax?: number
+    humMin?: number; humMax?: number; luxMin?: number; luxMax?: number
+    lightHours?: number; feedEveryDays?: number
+    profileId?: string; profileLocal?: boolean
+  }
 }
 
 type HistoryRow = { temperature?: number; humidity?: number; soilMoisture?: number; lightLux?: number }
@@ -532,6 +562,11 @@ type StageDef = {
   moistureMax: number
   lightHours: number
   feedEveryDays: number
+  // Optional: older plant profiles don't have these, and the cards simply show no target for them
+  humidityMin?: number
+  humidityMax?: number
+  luxMin?: number
+  luxMax?: number
 }
 
 type PlanView = { plantId: string; name: string; startedAt: number; stages: StageDef[] }
@@ -554,24 +589,74 @@ type PlantProfile = {
   stages: StageDef[]
 }
 
-function toStageList(raw: any): StageDef[] {
-  return Object.entries(raw ?? {})
-    .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
-    .map(([key, st]: [string, any]) => ({
-      key,
-      name: String(st?.name ?? key),
-      days: Number(st?.days) || 0,
-      tempMin: Number(st?.tempMin) || 0,
-      tempMax: Number(st?.tempMax) || 0,
-      moistureMin: Number(st?.moistureMin) || 0,
-      moistureMax: Number(st?.moistureMax) || 0,
-      lightHours: Number(st?.lightHours) || 0,
-      feedEveryDays: Number(st?.feedEveryDays) || 0,
-    }))
+// Built-in humidity (%) and light (lx) targets, used for any plant/stage whose data in Firebase doesn't set them.
+// Values saved in Firebase (humidityMin/Max, luxMin/Max on a stage) always win over these. Order per plant:
+// [seedling, vegetative, flowering, fruiting], each as [humMin, humMax, luxMin, luxMax].
+type RangeRow = [number, number, number, number]
+const DEFAULT_RANGES: Record<string, RangeRow[]> = {
+  lettuce:    [[65, 75, 5000, 15000],  [60, 70, 10000, 25000], [60, 70, 10000, 25000], [60, 70, 10000, 25000]],
+  tomato:     [[65, 75, 8000, 20000],  [60, 70, 20000, 40000], [55, 65, 25000, 50000], [60, 70, 30000, 60000]],
+  pepper:     [[65, 75, 8000, 20000],  [60, 70, 20000, 40000], [50, 70, 25000, 50000], [50, 70, 30000, 50000]],
+  strawberry: [[70, 80, 8000, 15000],  [65, 75, 15000, 30000], [60, 70, 20000, 40000], [60, 70, 20000, 40000]],
+  cucumber:   [[70, 80, 8000, 20000],  [65, 80, 20000, 40000], [60, 80, 25000, 50000], [60, 75, 30000, 50000]],
+  basil:      [[65, 75, 8000, 15000],  [55, 70, 15000, 35000], [50, 65, 20000, 40000], [50, 65, 20000, 40000]],
+  other:      [[65, 75, 5000, 15000],  [60, 70, 15000, 35000], [55, 70, 20000, 45000], [55, 70, 20000, 45000]],
+}
+
+function defaultRangeFor(plantName: string, stageName: string, index: number, count: number): RangeRow {
+  const p = plantName.toLowerCase()
+  const kind = /tomato/.test(p) ? "tomato"
+    : /lettuce|spinach|kale/.test(p) ? "lettuce"
+    : /chil+i|pepper|capsicum/.test(p) ? "pepper"
+    : /strawberr/.test(p) ? "strawberry"
+    : /cucumber|zucchini/.test(p) ? "cucumber"
+    : /basil/.test(p) ? "basil"
+    : "other"
+  const s = stageName.toLowerCase()
+  const slot = /seed|germ|sprout/.test(s) ? 0
+    : /veget|growth/.test(s) ? 1
+    : /flower|bloom/.test(s) ? 2
+    : /fruit|harvest|ripe|matur/.test(s) ? 3
+    : count > 1 ? Math.min(3, Math.round((index * 3) / (count - 1))) : 0
+  return DEFAULT_RANGES[kind][slot]
+}
+
+function toStageList(raw: any, plantName = ""): StageDef[] {
+  const entries = Object.entries(raw ?? {}).sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+  return entries
+    .map(([key, st]: [string, any], index): StageDef => {
+      const name = String(st?.name ?? key)
+      const [dHumMin, dHumMax, dLuxMin, dLuxMax] = defaultRangeFor(plantName, name, index, entries.length)
+      const hasHum = st?.humidityMin != null && st?.humidityMax != null
+      const hasLux = st?.luxMin != null && st?.luxMax != null
+      return {
+        key,
+        name,
+        days: Number(st?.days) || 0,
+        tempMin: Number(st?.tempMin) || 0,
+        tempMax: Number(st?.tempMax) || 0,
+        moistureMin: Number(st?.moistureMin) || 0,
+        moistureMax: Number(st?.moistureMax) || 0,
+        lightHours: Number(st?.lightHours) || 0,
+        feedEveryDays: Number(st?.feedEveryDays) || 0,
+        humidityMin: hasHum ? Number(st.humidityMin) || 0 : dHumMin,
+        humidityMax: hasHum ? Number(st.humidityMax) || 0 : dHumMax,
+        luxMin: hasLux ? Number(st.luxMin) || 0 : dLuxMin,
+        luxMax: hasLux ? Number(st.luxMax) || 0 : dLuxMax,
+      }
+    })
 }
 
 function stagesToObject(stages: StageDef[]) {
   return Object.fromEntries(stages.map(({ key, ...rest }) => [key, rest]))
+}
+
+// Plant ids become part of a file name on the hub (plant_<id>.json), so only simple ids are sent
+const HUB_PLANT_ID = /^[A-Za-z0-9_-]{1,40}$/
+
+// The compact copy of a plant profile that the hub stores locally (no image: it must fit in a few KB)
+function toHubProfile(p: PlantProfile) {
+  return { name: p.name, category: p.category, stages: stagesToObject(p.stages) }
 }
 
 function toPlant(id: string, p: any): PlantProfile {
@@ -580,7 +665,7 @@ function toPlant(id: string, p: any): PlantProfile {
     name: String(p?.name ?? id),
     category: String(p?.category ?? "Other"),
     ...(p?.image ? { image: String(p.image) } : {}),
-    stages: toStageList(p?.stages),
+    stages: toStageList(p?.stages, String(p?.name ?? id)),
   }
 }
 
@@ -693,12 +778,18 @@ function App() {
         .filter((id) => ghMeta[id] !== undefined)
         .map((id) => {
           const raw = ghMeta[id]
+          // A plan started from the app is just {plantId, name, startedAt}: the stage table is the plant's profile,
+          // the same one the hub keeps in its local storage. Older plans still carry their stages inline.
+          const planPlantId = String(raw.plan?.plantId ?? "")
+          const planProfile = raw.plan && !raw.plan.stages
+            ? [...downloadedPlants, ...library].find((pl) => pl.id === planPlantId)
+            : undefined
           const plan: PlanView | undefined = raw.plan
             ? {
-                plantId: String(raw.plan.plantId ?? ""),
-                name: String(raw.plan.name ?? "Plant"),
+                plantId: planPlantId,
+                name: String(raw.plan.name ?? planProfile?.name ?? "Plant"),
                 startedAt: Number(raw.plan.startedAt) || now,
-                stages: toStageList(raw.plan.stages),
+                stages: planProfile ? planProfile.stages : toStageList(raw.plan.stages, String(raw.plan.name ?? "")),
               }
             : undefined
           const cur = currentStage(plan, now)
@@ -712,7 +803,7 @@ function App() {
             plan,
           }
         }),
-    [ghIds, ghMeta, ghSeen, now]
+    [ghIds, ghMeta, ghSeen, now, downloadedPlants, library]
   )
   const myPlants = useMemo(
     () => downloadedPlants.map((p) => ({ ...p, image: library.find((l) => l.id === p.id)?.image ?? p.image })),
@@ -729,6 +820,10 @@ function App() {
     if (!cycle || cycle.finished) return undefined
     if (key === "temperature") return { min: cycle.stage.tempMin, max: cycle.stage.tempMax }
     if (key === "soilMoisture") return { min: cycle.stage.moistureMin, max: cycle.stage.moistureMax }
+    if (key === "humidity" && cycle.stage.humidityMin !== undefined && cycle.stage.humidityMax !== undefined && cycle.stage.humidityMax > 0)
+      return { min: cycle.stage.humidityMin, max: cycle.stage.humidityMax }
+    if (key === "lightLux" && cycle.stage.luxMin !== undefined && cycle.stage.luxMax !== undefined && cycle.stage.luxMax > 0)
+      return { min: cycle.stage.luxMin, max: cycle.stage.luxMax }
     return undefined
   }
   const online = isOnline(greenhouse?.lastSeen, now)
@@ -737,7 +832,7 @@ function App() {
   const lowWater = typeof live?.waterTank === "number" && live.waterTank < 20
   const lastUpdate = live?.updatedAt ? new Date(live.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "never"
   const avgTemp = history.length ? (history.reduce((a, b) => a + b, 0) / history.length).toFixed(1) : null
-  const controls = controlDefs.map((def) => ({ ...def, enabled: controlState[def.key] === true, detail: controlState[def.key] === true ? "On" : "Off" }))
+  const runningNow = runningActuators(live, online, stopped)
 
   useEffect(() => onAuthStateChanged(auth, (u) => { setUser(u); setAuthReady(true) }), [])
 
@@ -875,6 +970,58 @@ function App() {
         .catch((e) => { delete syncedPlans.current[id]; console.error("Plant cycle backup failed:", e) })
     }
   }, [user?.uid, ghIds, ghMeta])
+
+  // 3c) Keep each running plan in step with its plant profile. The plan is a copy made when the cycle started, so
+  //     a later change to the profile (or to the built-in humidity and light defaults) would leave the hub working
+  //     to old numbers. When they differ, the profile's stages are written into the plan again; the start date
+  //     of the cycle is not touched.
+  const pushedStages = useRef<Record<string, string>>({})
+  useEffect(() => { pushedStages.current = {} }, [user?.uid])
+  useEffect(() => {
+    if (!user) return
+    const profiles = [...library, ...downloadedPlants]
+    if (profiles.length === 0) return
+    const fields = ["name", "days", "tempMin", "tempMax", "moistureMin", "moistureMax", "lightHours", "feedEveryDays", "humidityMin", "humidityMax", "luxMin", "luxMax"]
+    for (const id of ghIds) {
+      const plan = ghMeta[id]?.plan
+      if (!plan?.plantId || !plan.stages) continue      // new-format plans have no inline stages: the hub reads its local copy
+      const profile = profiles.find((pl) => pl.id === plan.plantId)
+      if (!profile) continue
+      const wanted = stagesToObject(profile.stages) as Record<string, any>
+      const have = (plan.stages ?? {}) as Record<string, any>
+      const wantedKeys = Object.keys(wanted).sort()
+      const haveKeys = Object.keys(have).sort()
+      const same = wantedKeys.length === haveKeys.length && wantedKeys.every((k, i) => k === haveKeys[i] && fields.every((f) => {
+        const a = wanted[k]?.[f], b = have[k]?.[f]
+        return f === "name" ? String(a ?? "") === String(b ?? "") : Number(a) === Number(b)
+      }))
+      if (same) continue
+      const json = JSON.stringify(wanted)
+      if (pushedStages.current[id] === json) continue        // already sent, waiting for the database to echo it back
+      pushedStages.current[id] = json
+      update(ref(db, `greenhouses/${id}/meta/plan`), { name: profile.name, stages: wanted })
+        .catch((e) => { delete pushedStages.current[id]; console.error("Plan sync failed:", e) })
+    }
+  }, [user?.uid, ghIds, ghMeta, library, downloadedPlants])
+
+  // 3d) "Add to my plants" also sends the profile to each of the user's hubs (/greenhouses/<id>/library/<plantId>).
+  //     The hub notices within seconds, copies it to its local storage (the PC over USB for now, a TF card later)
+  //     and controls the greenhouse from that local file. Hubs added later get every saved plant as well.
+  const sentToHub = useRef<Set<string>>(new Set())
+  useEffect(() => { sentToHub.current = new Set() }, [user?.uid])
+  useEffect(() => {
+    if (!user) return
+    for (const id of ghIds) {
+      for (const p of downloadedPlants) {
+        if (!HUB_PLANT_ID.test(p.id)) continue
+        const key = `${id}/${p.id}`
+        if (sentToHub.current.has(key)) continue
+        sentToHub.current.add(key)
+        set(ref(db, `greenhouses/${id}/library/${p.id}`), toHubProfile(p))
+          .catch((e) => { sentToHub.current.delete(key); console.error("Hub library send failed:", e) })
+      }
+    }
+  }, [user?.uid, ghIds, downloadedPlants])
 
   // Select a newly claimed greenhouse once it shows up; keep the index in range
   useEffect(() => {
@@ -1196,7 +1343,25 @@ function App() {
 
   const setControlFlag = (key: string, value: boolean) => {
     if (!greenhouse) return
-    set(ref(db, `greenhouses/${greenhouse.id}/controls/${key}`), value).catch((e) => console.error("Control write failed:", e))
+    const base = `greenhouses/${greenhouse.id}/controls`
+
+    if (key === "manual" && value) {
+      // Take over from what the hub is doing right now, so nothing jumps when manual mode starts and no switch
+      // left on from an earlier manual session can start a device. Watering and feeding always start off.
+      const r = live?.relays ?? {}
+      update(ref(db, base), {
+        manual: true,
+        cooler: r.fan === true,
+        heater: r.heater === true,
+        humidifier: r.humidifier === true,
+        lights: r.lights === true,
+        pump: false,
+        fertilizer: false,
+      }).catch((e) => console.error("Control write failed:", e))
+      return
+    }
+
+    set(ref(db, `${base}/${key}`), value).catch((e) => console.error("Control write failed:", e))
   }
 
   const toggleControl = (key: string) => {
@@ -1346,36 +1511,26 @@ function App() {
 
           <section className="grid gap-5">
             <div className="rounded-3xl border border-border bg-white p-6 shadow-card">
+              <div className="flex items-start justify-between">
+                <div><p role="heading" aria-level={2} className="text-base font-bold">Running now</p><p className="mt-1 text-xs text-muted">{stopped ? "System paused" : !online ? "Hub offline" : manualMode ? "Manual mode" : "Auto mode"}</p></div>
+                <button onClick={() => setActiveNav("Actions")} className="text-xs font-bold text-forest">View actions</button>
+              </div>
+              <div className="mt-4 flex flex-wrap gap-2">
+                {runningNow.length === 0
+                  ? <span className="text-xs text-muted">Nothing is running right now.</span>
+                  : runningNow.map((d) => <span key={d.id} className="flex items-center gap-1.5 rounded-full bg-mint px-3 py-1.5 text-[11px] font-bold text-forest"><Icon name={d.icon} size={13} />{d.name}</span>)}
+              </div>
+            </div>
+
+            <div className="rounded-3xl border border-border bg-white p-6 shadow-card">
               <div><p role="heading" aria-level={2} className="text-base font-bold">Temperature trend</p><p className="mt-1 text-xs text-muted">{avgTemp ? `Average ${avgTemp}°C · last ${history.length} readings` : "No readings recorded yet"}</p></div>
               <div className="mt-6"><Sparkline values={history} /></div>
             </div>
 
-            <div className="rounded-3xl border border-border bg-white p-6 shadow-card">
-              <div className="flex items-start justify-between">
-                <div><p role="heading" aria-level={2} className="text-base font-bold">Device controls</p><p className="mt-1 text-xs text-muted">{manualMode ? "Manual control enabled" : "Controlled by plant profile"}</p></div>
-                <button onClick={() => setControlFlag("manual", !manualMode)} disabled={stopped} className={`rounded-full px-3 py-1.5 text-xs font-semibold tracking-normal transition disabled:opacity-40 ${manualMode ? "bg-amber-soft text-amber-ink" : "bg-mint text-forest"}`}>{manualMode ? "Manual mode" : "Auto mode"}</button>
-              </div>
-              <div className={`mt-4 rounded-xl p-3 text-[10px] leading-4 ${manualMode ? "bg-amber-soft text-amber-ink" : "bg-canvas text-muted"}`}>
-                {manualMode ? "Manual mode is active. Device switches are now unlocked." : "Switch to Manual Mode before toggling lights, pumps, heating, cooling, or humidity."}
-              </div>
-              <div className="mt-5 divide-y divide-border">
-                {controls.map((control) => (
-                  <div key={control.name} className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
-                    <div className={`grid size-10 place-items-center rounded-xl ${control.enabled && !stopped ? "bg-mint text-forest" : "bg-canvas text-muted"}`}><Icon name={control.icon} size={18} /></div>
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate text-xs font-bold">{control.name}</p>
-                      <p className="mt-1 truncate text-[10px] text-muted">{stopped ? "System paused" : !manualMode ? `Auto · ${control.detail}` : control.detail}</p>
-                    </div>
-                    <button disabled={stopped || !manualMode} onClick={() => toggleControl(control.key)} className={`relative h-6 w-11 rounded-full transition disabled:cursor-not-allowed disabled:opacity-40 ${control.enabled && !stopped ? "bg-leaf" : "bg-border"}`} aria-label={`Toggle ${control.name}`}>
-                      <span className={`absolute top-1 size-4 rounded-full bg-white shadow-sm transition ${control.enabled && !stopped ? "left-6" : "left-1"}`} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </div>
           </section>
           </div> : <NoDeviceState section="Overview" onConnect={() => setProfileOpen(true)} />)}
 
+          {activeNav === "Actions" && (loading ? <LoadingState /> : hasDevice ? <ActionsPage live={live} controlState={controlState} manualMode={manualMode} stopped={stopped} online={online} onSetFlag={setControlFlag} onToggle={toggleControl} /> : <NoDeviceState section="Overview" onConnect={() => setProfileOpen(true)} />)}
           {activeNav === "Plants" && (
             <PlantsPage
               plants={myPlants}
@@ -1388,7 +1543,6 @@ function App() {
                   plantId: plant.id,
                   name: plant.name,
                   startedAt: Date.now(),
-                  stages: stagesToObject(plant.stages),
                 }).then(() => buzzResult("success")).catch((e) => { console.error(e); buzzResult("error") })
               }}
               onStop={() => {
@@ -1407,6 +1561,9 @@ function App() {
             <PlantLibraryPage
               library={library}
               savedIds={downloadedPlants.map((p) => p.id)}
+              hubIds={live?.library?.ids}
+              hubName={greenhouse?.name}
+              hubOnline={online}
               onDownload={(plant) => {
                 if (!user) return
                 set(ref(db, `userPlants/${user.uid}/${plant.id}`), {
@@ -2313,6 +2470,8 @@ function StageRow({ stage, active }: { stage: StageDef; active: boolean }) {
       <div className="mt-3 grid grid-cols-2 gap-2 text-[11px]">
         <span><span className="text-muted">Temp </span><b>{fmtRange(stage.tempMin, stage.tempMax, "°C")}</b></span>
         <span><span className="text-muted">Soil </span><b>{fmtRange(stage.moistureMin, stage.moistureMax, "%")}</b></span>
+        {stage.humidityMin !== undefined && stage.humidityMax !== undefined && <span><span className="text-muted">Humidity </span><b>{fmtRange(stage.humidityMin, stage.humidityMax, "%")}</b></span>}
+        {stage.luxMin !== undefined && stage.luxMax !== undefined && <span><span className="text-muted">Lux </span><b>{fmtRange(stage.luxMin, stage.luxMax, " lx")}</b></span>}
         <span><span className="text-muted">Light </span><b>{stage.lightHours} h/day</b></span>
         <span><span className="text-muted">Feed </span><b>every {stage.feedEveryDays} d</b></span>
       </div>
@@ -2411,9 +2570,12 @@ function PlantsPage({ plants, greenhouse, now, online, onStart, onStop }: {
   )
 }
 
-function PlantLibraryPage({ library, savedIds, onDownload }: {
+function PlantLibraryPage({ library, savedIds, hubIds, hubName, hubOnline, onDownload }: {
   library: PlantProfile[]
   savedIds: string[]
+  hubIds?: string          // plants the hub reports as stored locally, e.g. ",tomato,basil,"
+  hubName?: string         // undefined = no greenhouse added yet
+  hubOnline: boolean
   onDownload: (plant: PlantProfile) => void
 }) {
   const [category, setCategory] = useState("All presets")
@@ -2455,6 +2617,14 @@ function PlantLibraryPage({ library, savedIds, onDownload }: {
                 <button onClick={() => onDownload(plant)} disabled={saved} className={`w-full rounded-xl px-4 py-2.5 text-xs font-bold transition ${saved ? "bg-mint text-forest" : "bg-forest text-white"}`}>
                   {saved ? "Added to my plants" : "Add to my plants"}
                 </button>
+                {saved && (() => {
+                  const onHub = !!hubIds && hubIds.includes(`,${plant.id},`)
+                  const msg = !hubName ? "Add a greenhouse to store this plant on your hub"
+                    : onHub ? `Stored on ${hubName}`
+                    : hubOnline ? `Sending to ${hubName}…`
+                    : `${hubName} is offline: it will store this when it reconnects`
+                  return <p className={`mt-2 text-center text-[11px] font-bold ${onHub ? "text-green-ink" : "text-muted"}`}>{onHub ? "✓ " : ""}{msg}</p>
+                })()}
               </div>
             </div>
           )
@@ -2516,6 +2686,116 @@ function StageTimeline({ plan, cycle }: { plan: PlanView; cycle: NonNullable<Ret
         })}
       </div>
     </section>
+  )
+}
+
+function ActionsPage({ live, controlState, manualMode, stopped, online, onSetFlag, onToggle }: {
+  live: LiveData | null
+  controlState: Record<string, boolean>
+  manualMode: boolean
+  stopped: boolean
+  online: boolean
+  onSetFlag: (key: string, value: boolean) => void
+  onToggle: (key: string) => void
+}) {
+  const relays = live?.relays ?? {}
+  const actions = live?.actions ?? {}
+  const isOn = (d: ActuatorDef) => online && relays[d.relay] === true
+  const running = actuatorDefs.filter(isOn)
+  const expectedMode = stopped ? "stopped" : manualMode ? "manual" : "auto"
+  const waitingForHub = online && !!live?.mode && live.mode !== expectedMode
+
+  const reasonFor = (d: ActuatorDef): string => {
+    switch (d.id) {
+      case "fan": return relays.compressor ? "Running together with the cooling compressor" : actions.cooler ?? ""
+      case "compressor": return actions.cooler ?? ""
+      case "heater": return actions.heater ?? ""
+      case "mister": return actions.humidifier ?? ""
+      case "pump": return actions.pump ?? ""
+      case "valve": return "Open while water is flowing"
+      case "fert": return actions.fertilizer ?? ""
+      case "lights": return actions.lights ?? ""
+    }
+    return ""
+  }
+
+  const groups = ["Climate", "Water & feeding", "Lighting"]
+
+  return (
+    <div className="grid gap-5 landscape:grid-cols-2 landscape:items-start">
+      <section className="grid gap-5">
+        <div className="rounded-3xl border border-border bg-white p-6 shadow-card">
+          <div>
+            <p role="heading" aria-level={2} className="text-base font-bold">Control mode</p>
+            <p className="mt-1 text-xs text-muted">{manualMode ? "You switch the devices yourself" : "The hub decides from your plant profile"}</p>
+          </div>
+          <div className="mt-4 grid grid-cols-2 gap-1 rounded-2xl bg-canvas p-1">
+            {[{ manual: false, label: "Auto mode" }, { manual: true, label: "Manual mode" }].map((opt) => (
+              <button key={opt.label} disabled={stopped} onClick={() => onSetFlag("manual", opt.manual)} className={`rounded-xl py-2.5 text-xs font-bold transition disabled:opacity-40 ${manualMode === opt.manual ? (opt.manual ? "bg-amber-soft text-amber-ink shadow-sm" : "bg-forest text-white shadow-sm") : "text-muted"}`}>{opt.label}</button>
+            ))}
+          </div>
+          <div className={`mt-4 rounded-xl p-3 text-[10px] leading-4 ${manualMode ? "bg-amber-soft text-amber-ink" : "bg-canvas text-muted"}`}>
+            {manualMode
+              ? "Manual mode is active. The switches below are unlocked. The heater and humidifier never run together, the cooling compressor stays off, and the irrigation pump stops by itself after 5 minutes."
+              : "Switch to Manual mode before toggling the fan, heater, humidifier, pump, fertilizer or lights."}
+          </div>
+          {waitingForHub && <p className="mt-3 text-[10px] font-semibold text-muted">Waiting for the hub to switch to {expectedMode} mode…</p>}
+        </div>
+
+        <div className="rounded-3xl border border-border bg-white p-6 shadow-card">
+          <div className="flex items-start justify-between">
+            <div><p role="heading" aria-level={2} className="text-base font-bold">Running now</p><p className="mt-1 text-xs text-muted">{stopped ? "System paused" : !online ? "Hub offline, last reported state" : `${running.length} of ${actuatorDefs.length} devices on`}</p></div>
+          </div>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {running.length === 0
+              ? <span className="text-xs text-muted">Nothing is running right now.</span>
+              : running.map((d) => <span key={d.id} className="flex items-center gap-1.5 rounded-full bg-mint px-3 py-1.5 text-[11px] font-bold text-forest"><Icon name={d.icon} size={13} />{d.name}</span>)}
+          </div>
+          {(live?.blocked || live?.warn || !online) && (
+            <div className="mt-4 space-y-2">
+              {!online && <p className="rounded-xl bg-amber-soft p-3 text-[10px] font-semibold leading-4 text-amber-ink">The hub is offline. Switches may not respond until it reconnects.</p>}
+              {online && live?.blocked && <p className="rounded-xl bg-amber-soft p-3 text-[10px] font-semibold leading-4 text-amber-ink">{live.blocked}</p>}
+              {online && live?.warn && <p className="rounded-xl bg-coral-soft p-3 text-[10px] font-semibold leading-4 text-coral">{live.warn}</p>}
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="grid gap-5">
+        {groups.map((group) => (
+          <div key={group} className="rounded-3xl border border-border bg-white p-6 shadow-card">
+            <p className="text-[10px] font-bold uppercase tracking-wide text-muted">{group}</p>
+            <div className="mt-4 divide-y divide-border">
+              {actuatorDefs.filter((d) => d.group === group).map((d) => {
+                const on = isOn(d)
+                const c = toneClasses[d.tone]
+                const reason = on ? (reasonFor(d) || (manualMode ? "Switched on manually" : "Running automatically")) : ""
+                const switchOn = d.control ? (manualMode ? controlState[d.control] === true : on) : on
+                return (
+                  <div key={d.id} className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
+                    <div className={`grid size-10 shrink-0 place-items-center rounded-xl ${on ? `${c.soft} ${c.ink}` : "bg-canvas text-muted"}`}><Icon name={d.icon} size={18} /></div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <p className="truncate text-xs font-bold">{d.name}</p>
+                        <span className={`shrink-0 rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide ${on ? "bg-mint text-forest" : "bg-canvas text-muted"}`}>{!online ? "Offline" : on ? "On" : "Off"}</span>
+                      </div>
+                      <p className="mt-1 text-[10px] leading-4 text-muted">{reason || (d.control ? (manualMode ? "Tap the switch to turn it on" : "Idle, controlled automatically") : d.note ?? "Idle")}</p>
+                    </div>
+                    {d.control ? (
+                      <button disabled={stopped || !manualMode} onClick={() => onToggle(d.control!)} className={`relative h-6 w-11 shrink-0 rounded-full transition disabled:cursor-not-allowed disabled:opacity-40 ${switchOn && !stopped ? "bg-leaf" : "bg-border"}`} aria-label={`Toggle ${d.name}`}>
+                        <span className={`absolute top-1 size-4 rounded-full bg-white shadow-sm transition ${switchOn && !stopped ? "left-6" : "left-1"}`} />
+                      </button>
+                    ) : (
+                      <span className="shrink-0 text-[9px] font-semibold text-muted">{d.note}</span>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        ))}
+      </section>
+    </div>
   )
 }
 
@@ -2611,10 +2891,19 @@ function NotifRow({ icon, title, detail, on, onToggle }: { icon: IconName; title
 function GreenhouseInsights({ greenhouse, now, onClose }: { greenhouse: Greenhouse; now: number; onClose: () => void }) {
   const [live, setLive] = useState<LiveData & { relays?: Record<string, boolean> } | null>(null)
   const [rows, setRows] = useState<HistoryRow[]>([])
+  const [dayStart, setDayStart] = useState<{ minutes: number; tzOffsetMin: number } | null>(null)
+  const [dayInput, setDayInput] = useState("00:00")
+  const [dayDirty, setDayDirty] = useState(false)
+  const [daySaving, setDaySaving] = useState(false)
+  const [dayMsg, setDayMsg] = useState("")
 
   useEffect(() => {
     const base = `greenhouses/${greenhouse.id}`
     const offLive = onValue(ref(db, `${base}/live`), (s) => setLive(s.val() ?? {}))
+    const offDay = onValue(ref(db, `${base}/meta/dayStart`), (s) => {
+      const v = s.val()
+      setDayStart(v && Number.isFinite(Number(v.minutes)) ? { minutes: Number(v.minutes), tzOffsetMin: Number(v.tzOffsetMin) || 0 } : null)
+    })
     const offHist = onValue(query(ref(db, `${base}/history`), limitToLast(48)), (s) => {
       const num = (x: any) => (x != null && Number.isFinite(Number(x)) ? Number(x) : undefined)
       const out: HistoryRow[] = []
@@ -2624,8 +2913,36 @@ function GreenhouseInsights({ greenhouse, now, onClose }: { greenhouse: Greenhou
       })
       setRows(out)
     })
-    return () => { offLive(); offHist() }
+    return () => { offLive(); offHist(); offDay() }
   }, [greenhouse.id])
+
+  const hhmm = (m: number) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`
+  const tzLabel = (min: number) => `UTC${min < 0 ? "-" : "+"}${String(Math.floor(Math.abs(min) / 60)).padStart(2, "0")}:${String(Math.abs(min) % 60).padStart(2, "0")}`
+  const phoneTz = -new Date().getTimezoneOffset()
+
+  // Show the saved value until the person starts editing
+  useEffect(() => {
+    if (!dayDirty) setDayInput(hhmm(dayStart?.minutes ?? 0))
+  }, [dayStart, dayDirty])
+
+  const saveDayStart = async () => {
+    const [h, m] = dayInput.split(":").map(Number)
+    if (!Number.isFinite(h) || !Number.isFinite(m)) return
+    setDaySaving(true)
+    setDayMsg("")
+    try {
+      await set(ref(db, `greenhouses/${greenhouse.id}/meta/dayStart`), { minutes: h * 60 + m, tzOffsetMin: phoneTz, updatedAt: Date.now() })
+      setDayDirty(false)
+      setDayMsg("Saved. The hub picks it up within a minute.")
+    } catch (e) {
+      console.error("Day start save failed:", e)
+      setDayMsg("Could not save. Check your connection and try again.")
+    } finally {
+      setDaySaving(false)
+    }
+  }
+  const hubDay = live?.dayStart
+  const daySynced = !!dayStart && hubDay?.minutes === dayStart.minutes && (hubDay?.tzOffsetMin ?? 0) === dayStart.tzOffsetMin
 
   const online = isOnline(greenhouse.lastSeen, now)
   const seen = (() => {
@@ -2785,6 +3102,64 @@ function GreenhouseInsights({ greenhouse, now, onClose }: { greenhouse: Greenhou
             ) : (
               <div className="mt-3 flex items-center gap-3 text-sm text-muted"><div className="grid size-10 place-items-center rounded-xl bg-canvas"><Icon name="leaf" size={18} /></div>No active cycle. Start one from Plants.</div>
             )}
+          </div>
+
+          {/* Hub sync: the plant profile's targets next to what the hub says it is controlling to */}
+          {cyc && !cyc.finished && (() => {
+            const hp = live?.plan
+            const st = cyc.stage
+            const close = (a: number | undefined, b: number | undefined) => a === undefined || (b !== undefined && Math.abs(a - b) < 0.11)
+            const pair = (aMin?: number, aMax?: number, hMin?: number, hMax?: number) =>
+              aMin === undefined || aMax === undefined || (close(aMin, hMin) && close(aMax, hMax))
+            const rng = (a?: number, b?: number, unit = "") => (a !== undefined && b !== undefined ? `${a}–${b}${unit}` : "—")
+            const rows = hp?.active ? [
+              { label: "Stage", app: st.name, hub: hp.stage ?? "—", ok: (hp.stage ?? "").toLowerCase() === st.name.toLowerCase() },
+              { label: "Temperature", app: rng(st.tempMin, st.tempMax, "°C"), hub: rng(hp.tempMin, hp.tempMax, "°C"), ok: pair(st.tempMin, st.tempMax, hp.tempMin, hp.tempMax) },
+              { label: "Soil moisture", app: rng(st.moistureMin, st.moistureMax, "%"), hub: rng(hp.moistureMin, hp.moistureMax, "%"), ok: pair(st.moistureMin, st.moistureMax, hp.moistureMin, hp.moistureMax) },
+              { label: "Humidity", app: rng(st.humidityMin, st.humidityMax, "%"), hub: rng(hp.humMin, hp.humMax, "%"), ok: pair(st.humidityMin, st.humidityMax, hp.humMin, hp.humMax) },
+              { label: "Light", app: rng(st.luxMin, st.luxMax, " lx"), hub: rng(hp.luxMin, hp.luxMax, " lx"), ok: pair(st.luxMin, st.luxMax, hp.luxMin, hp.luxMax) },
+              { label: "Light hours", app: `${st.lightHours} h`, hub: hp.lightHours !== undefined ? `${hp.lightHours} h` : "—", ok: close(st.lightHours, hp.lightHours) },
+              { label: "Feeding", app: `every ${st.feedEveryDays} d`, hub: hp.feedEveryDays !== undefined ? `every ${hp.feedEveryDays} d` : "—", ok: close(st.feedEveryDays, hp.feedEveryDays) },
+            ] : []
+            const bad = rows.filter((r) => !r.ok).length
+            return (
+              <div className="rounded-3xl border border-border bg-white p-5 shadow-card">
+                <p className="text-[10px] font-bold uppercase tracking-wide text-muted">Hub sync</p>
+                {!hp?.active ? (
+                  <p className="mt-2 text-xs leading-5 text-muted">
+                    {online ? "The hub has not loaded this plant cycle yet. It checks every minute." : "Waiting for the hub to come online."}
+                  </p>
+                ) : (
+                  <>
+                    <p className={`mt-2 text-xs font-bold ${bad === 0 ? "text-green-ink" : "text-amber-ink"}`}>
+                      {bad === 0 ? "The hub is using the same targets as the plant profile" : `${bad} value${bad > 1 ? "s" : ""} differ between the app and the hub`}
+                    </p>
+                    <div className="mt-3 divide-y divide-border text-[11px]">
+                      {rows.map((r) => (
+                        <div key={r.label} className="flex items-center gap-2 py-2">
+                          <span className="w-24 shrink-0 text-muted">{r.label}</span>
+                          <span className="min-w-0 flex-1 font-bold">{r.app}</span>
+                          <span className={`shrink-0 font-bold ${r.ok ? "text-green-ink" : "text-amber-ink"}`}>{r.ok ? "✓" : `Hub: ${r.hub}`}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+            )
+          })()}
+
+          {/* Day start */}
+          <div className="rounded-3xl border border-border bg-white p-5 shadow-card">
+            <p className="text-[10px] font-bold uppercase tracking-wide text-muted">Start of the day</p>
+            <p className="mt-2 text-xs leading-5 text-muted">Choose when the hub starts a new day. The grow-light daily limit resets at this time. It follows your phone's time zone ({tzLabel(phoneTz)}).</p>
+            <div className="mt-4 flex items-center gap-3">
+              <input type="time" value={dayInput} onChange={(e) => { setDayInput(e.target.value); setDayDirty(true); setDayMsg("") }} className="rounded-xl border border-border bg-canvas px-3 py-2 text-sm font-bold" aria-label="Start of the day" />
+              <button onClick={saveDayStart} disabled={!dayDirty || daySaving || !dayInput} className="rounded-xl bg-forest px-4 py-2.5 text-xs font-bold text-white transition active:scale-95 disabled:opacity-40">{daySaving ? "Saving…" : "Save"}</button>
+            </div>
+            <p className="mt-3 text-[10px] font-semibold text-muted">
+              {dayMsg || (dayStart ? (daySynced ? `Hub is using ${hhmm(dayStart.minutes)}` : `Saved as ${hhmm(dayStart.minutes)}, waiting for the hub to confirm`) : "Not set, the hub uses midnight (UTC)")}
+            </p>
           </div>
 
           {/* Supplies */}
